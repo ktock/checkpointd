@@ -18,7 +18,7 @@ package eventlog
 import (
 	"context"
 
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/proto"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -34,6 +34,9 @@ type EventLog interface {
 
 	// Events returns all events for the conversation.
 	Events(ctx context.Context, conversationID string) ([]*proto.StepEvent, error)
+
+	// EventsBySessionID returns all events for session.
+	EventsBySessionID(ctx context.Context, sessionID string) ([]*proto.StepEvent, error)
 
 	// Close releases the underlying resources and closes the log.
 	Close() error

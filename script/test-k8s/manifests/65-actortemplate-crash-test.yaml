@@ -1,0 +1,93 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Two ActorTemplates for crash_test_agent, backing test.sh's two crash-recovery durability tests: one killed externally, one self-panicking.
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: crash-test-external-template
+  namespace: ${NS}
+spec:
+  workerSelector:
+    matchLabels:
+      workload: ${NS}-harness
+  containers:
+    - name: crash-test-agent
+      image: "${CRASH_TEST_AGENT_IMAGE}"
+      command:
+        - /app/crash-test-agent
+        - --harness-addr
+        - 0.0.0.0:80
+        - --target
+        - echo-agent
+        - --calls
+        - "3"
+        - --crash-before-call
+        - "2"
+        - --testserver-addr
+        - testserver.${NS}.svc:8080
+        - --checkpointd-addr
+        - checkpointd-server.${NS}.svc:80
+      env:
+        - name: CHECKPOINTD_AGENT
+          value: "true"
+        - name: CHECKPOINTD_AGENT_ID
+          value: crash-test-external
+        - name: CHECKPOINTD_AGENT_CARD
+          value: |
+            name: Crash Test Agent (external pod kill)
+            description: Calls echo-agent 3 times in sequence, signaling testserver before call 2 -- the test script force-deletes this actor's own worker pod once signaled
+            version: 1.0.0
+  snapshotsConfig:
+    location: "gs://ate-snapshots/${NS}/crash-test-external/"
+---
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: crash-test-selfpanic-template
+  namespace: ${NS}
+spec:
+  workerSelector:
+    matchLabels:
+      workload: ${NS}-harness
+  containers:
+    - name: crash-test-agent
+      image: "${CRASH_TEST_AGENT_IMAGE}"
+      command:
+        - /app/crash-test-agent
+        - --harness-addr
+        - 0.0.0.0:80
+        - --target
+        - echo-agent
+        - --calls
+        - "3"
+        - --crash-before-call
+        - "2"
+        - --testserver-addr
+        - testserver.${NS}.svc:8080
+        - --self-panic
+        - --checkpointd-addr
+        - checkpointd-server.${NS}.svc:80
+      env:
+        - name: CHECKPOINTD_AGENT
+          value: "true"
+        - name: CHECKPOINTD_AGENT_ID
+          value: crash-test-selfpanic
+        - name: CHECKPOINTD_AGENT_CARD
+          value: |
+            name: Crash Test Agent (self panic)
+            description: Calls echo-agent 3 times in sequence, panicking itself right after signaling testserver before call 2, once per bootstrap input
+            version: 1.0.0
+  snapshotsConfig:
+    location: "gs://ate-snapshots/${NS}/crash-test-selfpanic/"

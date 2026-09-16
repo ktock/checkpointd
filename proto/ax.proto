@@ -19,7 +19,7 @@ package ax;
 import "google/protobuf/struct.proto";
 import "proto/content.proto";
 
-option go_package = "github.com/google/ax/proto";
+option go_package = "github.com/ktock/checkpointd/proto";
 
 // WARNING: This file is in active development and
 // significant changes can be made with breaking changes.
@@ -34,6 +34,10 @@ message StepEvent {
   google.protobuf.Struct agent_config = 4;
   repeated Step steps = 5;
   State state = 6;
+
+  // session_id is an opaque, caller-assigned key grouping events across
+  // potentially many conversation_ids.
+  string session_id = 8;
 }
 
 message HarnessStart {
@@ -115,6 +119,9 @@ message CreateInteractionEvent {
 
   string agent_id = 4;                   // Agent ID, empty selects the default agent
   bytes agent_config = 5;                // Per-request agent configuration (opaque JSON), if any
+
+  // session_id is forwarded verbatim onto the StepEvent(s) this call logs.
+  string session_id = 6;
 }
 
 // CreateInteractionResponse contains the result of an interaction.

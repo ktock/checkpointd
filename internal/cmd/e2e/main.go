@@ -34,11 +34,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/google/ax/internal/controller"
-	"github.com/google/ax/internal/controller/eventlog"
-	"github.com/google/ax/internal/controller/eventlog/eventlogtest"
-	"github.com/google/ax/internal/harness/antigravity"
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/internal/controller"
+	"github.com/ktock/checkpointd/internal/controller/eventlog"
+	"github.com/ktock/checkpointd/internal/controller/eventlog/eventlogtest"
+	"github.com/ktock/checkpointd/internal/harness/antigravity"
+	"github.com/ktock/checkpointd/proto"
 )
 
 func main() {

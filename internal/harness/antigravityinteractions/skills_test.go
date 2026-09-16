@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/ax/internal/skills"
+	"github.com/ktock/checkpointd/internal/skills"
 )
 
 func TestSkillsSystemInstruction(t *testing.T) {

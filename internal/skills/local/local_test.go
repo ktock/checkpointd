@@ -20,7 +20,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/google/ax/internal/config"
+	"github.com/ktock/checkpointd/internal/config"
 )
 
 // writeSkillDir creates <parent>/<id>/SKILL.md so the id is discovered as a

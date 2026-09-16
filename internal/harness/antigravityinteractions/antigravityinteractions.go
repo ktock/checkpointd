@@ -59,10 +59,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/ax/internal/config"
-	"github.com/google/ax/internal/harness"
-	"github.com/google/ax/proto"
 	"github.com/google/uuid"
+	"github.com/ktock/checkpointd/internal/config"
+	"github.com/ktock/checkpointd/internal/harness"
+	"github.com/ktock/checkpointd/proto"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -301,6 +301,11 @@ func (e *antigravityInteractionsExecution) Queue(ctx context.Context, steps ...*
 	}
 	e.queued = append(e.queued, steps...)
 	return nil
+}
+
+// Checkpoint implements Execution.Checkpoint. Unimplemented on Antigravity(TODO).
+func (e *antigravityInteractionsExecution) Checkpoint(ctx context.Context) error {
+	return fmt.Errorf("unimplemented")
 }
 
 // Close implements Execution.Close.

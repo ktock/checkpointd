@@ -1,0 +1,42 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# "long-poll": polls long-wait in a retry loop, then reports the result, each retry its own checkpoint boundary.
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: long-poll-template
+  namespace: ${NS}
+spec:
+  workerSelector:
+    matchLabels:
+      workload: ${NS}-harness
+  containers:
+    - name: long-poll
+      image: "${LONG_POLL_IMAGE}"
+      # --checkpointd-addr lets this resolve long-wait's real AgentCard before calling it.
+      command: ["/app/long-poll", "--harness-addr", "0.0.0.0:80", "--checkpointd-addr", "checkpointd-server.${NS}.svc:80", "--testserver-addr", "testserver.${NS}.svc:8080"]
+      env:
+        # Exposed externally at /agents/long-poll/, the URL test.sh drives this demo through.
+        - name: CHECKPOINTD_AGENT
+          value: "true"
+        - name: CHECKPOINTD_AGENT_ID
+          value: long-poll
+        - name: CHECKPOINTD_AGENT_CARD
+          value: |
+            name: Long Poll
+            description: Polls long-wait in a retry loop and reports the result -- checkpointd's own recovery test for a long-polling, long-waiting agent pair, driven over real A2A
+            version: 1.0.0
+  snapshotsConfig:
+    location: "gs://ate-snapshots/${NS}/long-poll/"

@@ -19,7 +19,7 @@ package harness
 import (
 	"context"
 
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/proto"
 )
 
 // Handler defines the streaming event hook callbacks for an execution turn.
@@ -58,6 +58,13 @@ type Execution interface {
 	// ID returns the unique execution session ID.
 	ID() string
 
-	// Close cleanly releases all resources associated with the execution session.
+	// Checkpoint durably persists the state a future Start needs to resume
+	// this conversation from the turn Run just completed.
+	Checkpoint(ctx context.Context) error
+
+	// Close cleanly releases all resources associated with the execution
+	// session (e.g. connections). It carries no durability meaning -- use
+	// Checkpoint for that -- and is safe to call regardless of whether
+	// Checkpoint succeeded.
 	Close(ctx context.Context) error
 }

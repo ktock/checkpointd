@@ -1,0 +1,145 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# `checkpointd`, an always-on A2A server; the ServiceAccount/Role/RoleBinding
+# below grant it RBAC for --discover.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: checkpointd-server
+  namespace: checkpointd-llm-chat-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: checkpointd-server
+  namespace: checkpointd-llm-chat-demo
+rules:
+  - apiGroups: ["ate.dev"]
+    resources: ["actortemplates"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: checkpointd-server
+  namespace: checkpointd-llm-chat-demo
+subjects:
+  - kind: ServiceAccount
+    name: checkpointd-server
+    namespace: checkpointd-llm-chat-demo
+roleRef:
+  kind: Role
+  name: checkpointd-server
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: checkpointd-server
+  namespace: checkpointd-llm-chat-demo
+  labels:
+    app: checkpointd-server
+spec:
+  # StatefulSet with giving it a durable PVC so the event log
+  # backing every accepted task survives a pod restart.
+  serviceName: checkpointd-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkpointd-server
+  template:
+    metadata:
+      labels:
+        app: checkpointd-server
+    spec:
+      serviceAccountName: checkpointd-server
+      containers:
+        - name: checkpointd-server
+          image: "${CHECKPOINTD_IMAGE}"
+          command:
+            - /checkpointd-app/checkpointd
+            - --config=/etc/checkpointd/checkpointd.yaml
+            # Periodically lists ActorTemplates and serves any with
+            # CHECKPOINTD_AGENT=true at /agents/{id}/.
+            - --discover
+            - --addr=:80
+            - --base-url=http://checkpointd-server.checkpointd-llm-chat-demo.svc:80
+            - --substrate-ca-file=/var/run/secrets/ate-system/ca.crt
+          env:
+            - name: CHECKPOINTD_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: checkpointd-config
+              mountPath: /etc/checkpointd
+            - name: ate-token
+              mountPath: /var/run/secrets/ate-system
+              readOnly: true
+      volumes:
+        - name: checkpointd-config
+          configMap:
+            name: checkpointd-config
+        - name: ate-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: api.ate-system.svc
+                  expirationSeconds: 3600
+              - clusterTrustBundle:
+                  signerName: servicedns.podcert.ate.dev/identity
+                  labelSelector:
+                    matchLabels:
+                      podcert.ate.dev/canarying: live
+                  path: ca.crt
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Not headless: kubectl port-forward svc/checkpointd-server (see demo.sh)
+# is how the demo reaches this from the host, outside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkpointd-server
+  namespace: checkpointd-llm-chat-demo
+spec:
+  selector:
+    app: checkpointd-server
+  ports:
+    - port: 80
+      targetPort: 80
+      name: http

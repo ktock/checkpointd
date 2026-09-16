@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/ax/internal/pythonsidecar"
+	"github.com/ktock/checkpointd/internal/pythonsidecar"
 )
 
 func getFreePort(t *testing.T) int {
@@ -274,4 +274,3 @@ func TestSidecar_PIDFileHandling(t *testing.T) {
 		t.Fatalf("updated PID file mismatch: got %d, expected %d", newPID, s3.Pid())
 	}
 }
-

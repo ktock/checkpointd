@@ -18,14 +18,14 @@ import (
 	"context"
 	"sync"
 
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/proto"
 )
 
 // MemoryEventLog is an in-memory EventLog useful for testing and short-lived
 // executions. It does not survive process restarts.
 type MemoryEventLog struct {
-	mu            sync.Mutex
-	AllEvents     []*proto.StepEvent
+	mu        sync.Mutex
+	AllEvents []*proto.StepEvent
 }
 
 func (m *MemoryEventLog) Append(_ context.Context, event *proto.StepEvent) (int64, error) {
@@ -50,6 +50,22 @@ func (m *MemoryEventLog) Events(_ context.Context, conversationID string) ([]*pr
 	out := make([]*proto.StepEvent, 0)
 	for _, ev := range m.AllEvents {
 		if ev.ConversationId == conversationID {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+func (m *MemoryEventLog) EventsBySessionID(_ context.Context, sessionID string) ([]*proto.StepEvent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]*proto.StepEvent, 0)
+	if sessionID == "" {
+		return out, nil
+	}
+	for _, ev := range m.AllEvents {
+		if ev.SessionId == sessionID {
 			out = append(out, ev)
 		}
 	}

@@ -19,17 +19,28 @@ import (
 	"context"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
-	"github.com/google/ax/internal/pythonsidecar"
-	"github.com/google/ax/python"
+	"github.com/ktock/checkpointd/internal/pythonsidecar"
+	"github.com/ktock/checkpointd/python"
 )
 
+// requirePip skips the test when `python3 -m pip` isn't usable.
+func requirePip(t *testing.T) {
+	t.Helper()
+	if err := exec.Command("python3", "-m", "pip", "--version").Run(); err != nil {
+		t.Skip("python3 -m pip is not available; skipping Antigravity sidecar setup test")
+	}
+}
+
 func TestSetup_EmbeddedFS(t *testing.T) {
+	requirePip(t)
+
 	if _, err := fs.Stat(python.FS, "antigravity/__pycache__"); err == nil {
 		t.Errorf("expected antigravity/__pycache__ to be ignored when embedding, but it was found")
 	}

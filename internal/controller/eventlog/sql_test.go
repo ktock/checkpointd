@@ -16,11 +16,13 @@ package eventlog
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/proto"
 )
 
 // testEventLog runs the EventLog contract against a backend. newLog returns a
@@ -78,6 +80,108 @@ func testEventLog(t *testing.T, newLog func(t *testing.T) EventLog) {
 		}
 		if len(events) != 0 {
 			t.Fatalf("expected 0 events, got %d", len(events))
+		}
+	})
+
+	// EventsBySessionID confirms one task's full history comes back
+	// correctly ordered even though it spans multiple conversation_ids, and
+	// that other tasks' events (or events with no task at all) never leak in.
+	t.Run("EventsBySessionID", func(t *testing.T) {
+		ctx := context.Background()
+		log := newLog(t)
+
+		task := t.Name() + "-task"
+		otherTask := t.Name() + "-other-task"
+		convA := t.Name() + "-conv-a"
+		convB := t.Name() + "-conv-b"
+
+		mustAppend := func(conversationID, taskID, marker string) {
+			t.Helper()
+			if _, err := log.Append(ctx, &proto.StepEvent{ConversationId: conversationID, SessionId: taskID, InteractionId: marker}); err != nil {
+				t.Fatalf("append(%q, %q, %q): %v", conversationID, taskID, marker, err)
+			}
+		}
+
+		// Interleaved on purpose: convA's two turns, convB's one turn in
+		// between, a same-conversationID/different-task event, and a
+		// no-task-at-all event -- none of which EventsBySessionID(task)
+		// should ever return except the four genuinely belonging to task.
+		mustAppend(convA, task, "a1")
+		mustAppend(convB, task, "b1")
+		mustAppend(convA, otherTask, "a-other-task")
+		mustAppend(convA, "", "a-no-task")
+		mustAppend(convA, task, "a2")
+		mustAppend(convB, task, "b2")
+
+		events, err := log.EventsBySessionID(ctx, task)
+		if err != nil {
+			t.Fatalf("EventsBySessionID: %v", err)
+		}
+		var gotMarkers []string
+		for _, ev := range events {
+			gotMarkers = append(gotMarkers, ev.InteractionId)
+		}
+		want := []string{"a1", "b1", "a2", "b2"}
+		if len(gotMarkers) != len(want) {
+			t.Fatalf("EventsBySessionID markers = %v, want %v", gotMarkers, want)
+		}
+		for i := range want {
+			if gotMarkers[i] != want[i] {
+				t.Errorf("EventsBySessionID markers = %v, want %v", gotMarkers, want)
+				break
+			}
+		}
+
+		// A task_id nobody ever appended with, and the empty task_id
+		// itself, both come back empty rather than erroring or matching
+		// unrelated rows.
+		if events, err := log.EventsBySessionID(ctx, t.Name()+"-nonexistent-task"); err != nil || len(events) != 0 {
+			t.Errorf("EventsBySessionID(unknown task) = %v, %v, want empty, nil", events, err)
+		}
+		if events, err := log.EventsBySessionID(ctx, ""); err != nil || len(events) != 0 {
+			t.Errorf(`EventsBySessionID("") = %v, %v, want empty, nil (must never match no-task-id events)`, events, err)
+		}
+	})
+
+	// ConcurrentTasksDoNotRaceTaskStep appends to many distinct task_ids
+	// concurrently and confirms each task's own step sequence comes out
+	// dense and gap-free, never colliding with another task's counter.
+	t.Run("ConcurrentTasksDoNotRaceTaskStep", func(t *testing.T) {
+		ctx := context.Background()
+		log := newLog(t)
+
+		const numTasks = 8
+		const eventsPerTask = 5
+		var wg sync.WaitGroup
+		errs := make(chan error, numTasks)
+		for i := range numTasks {
+			task := fmt.Sprintf("%s-task-%d", t.Name(), i)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range eventsPerTask {
+					if _, err := log.Append(ctx, &proto.StepEvent{ConversationId: task, SessionId: task}); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("concurrent append failed: %v", err)
+		}
+
+		for i := range numTasks {
+			task := fmt.Sprintf("%s-task-%d", t.Name(), i)
+			events, err := log.EventsBySessionID(ctx, task)
+			if err != nil {
+				t.Fatalf("EventsBySessionID(%s): %v", task, err)
+			}
+			if len(events) != eventsPerTask {
+				t.Errorf("task %s: got %d events, want %d", task, len(events), eventsPerTask)
+			}
 		}
 	})
 

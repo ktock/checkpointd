@@ -21,8 +21,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/ax/internal/harness/harnesstest"
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/internal/harness/harnesstest"
+	"github.com/ktock/checkpointd/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"

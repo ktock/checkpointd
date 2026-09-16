@@ -1,0 +1,40 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate for tck_agent, the A2A TCK conformance-test scenario agent, exposed at /agents/tck-agent/.
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: tck-agent-template
+  namespace: ${NS}
+spec:
+  workerSelector:
+    matchLabels:
+      workload: ${NS}-harness
+  containers:
+    - name: tck-agent
+      image: "${TCK_AGENT_IMAGE}"
+      command: ["/app/tck-agent", "--harness-addr", "0.0.0.0:80"]
+      env:
+        - name: CHECKPOINTD_AGENT
+          value: "true"
+        - name: CHECKPOINTD_AGENT_ID
+          value: tck-agent
+        - name: CHECKPOINTD_AGENT_CARD
+          value: |
+            name: A2A TCK Conformance Agent
+            description: Routes on each message's own messageId prefix (tck-input-required, tck-complete-task, tck-reject-task, ...), matching the A2A TCK's own reference SUT -- see script/test-k8s/agents/tck_agent
+            version: 1.0.0
+  snapshotsConfig:
+    location: "gs://ate-snapshots/${NS}/tck-agent/"

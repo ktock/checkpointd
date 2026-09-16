@@ -45,12 +45,13 @@ func OpenSQLiteEventLog(path string) (EventLog, error) {
 			conversation_id TEXT NOT NULL,
 			step INTEGER NOT NULL,
 			payload TEXT NOT NULL,
+			session_id TEXT,
+			session_step INTEGER,
 			PRIMARY KEY (conversation_id, step)
 		)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite_eventlog: create conversation_log table: %w", err)
 	}
 
-
-	return &sqlEventLog{db: db}, nil
+	return &sqlEventLog{db: db, dialect: "sqlite"}, nil
 }

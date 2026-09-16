@@ -58,21 +58,97 @@ func NewClient(ns, template, target string, opts ...grpc.DialOption) (*Client, e
 }
 
 // CreateActor creates a new actor.
-func (c *Client) CreateActor(ctx context.Context, id string) (*ateapipb.CreateActorResponse, error) {
+func (c *Client) CreateActor(ctx context.Context, id string) (*ateapipb.Actor, error) {
 	client := ateapipb.NewControlClient(c.conn)
 	// TODO(wjjclaud): Configure atespace in manifests instead of reusing the namespace.
-	if _, err := client.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{Name: c.namespace}); err != nil && status.Code(err) != codes.AlreadyExists {
+	if _, err := client.CreateAtespace(ctx, &ateapipb.CreateAtespaceRequest{
+		Atespace: &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: c.namespace}},
+	}); err != nil && status.Code(err) != codes.AlreadyExists {
 		return nil, fmt.Errorf("error when calling Control.CreateAtespace: %w", err)
 	}
-	resp, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		ActorRef:               &ateapipb.ActorRef{Atespace: c.namespace, Name: id},
-		ActorTemplateNamespace: c.namespace,
-		ActorTemplateName:      c.template,
+	actor, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:               &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: id},
+			ActorTemplateNamespace: c.namespace,
+			ActorTemplateName:      c.template,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error when calling Control.CreateActor: %w", err)
 	}
-	return resp, nil
+	return actor, nil
+}
+
+// GetActor retrieves the current state of the actor backing conversationID.
+func (c *Client) GetActor(ctx context.Context, id string) (*ateapipb.Actor, error) {
+	client := ateapipb.NewControlClient(c.conn)
+	actor, err := client.GetActor(ctx, &ateapipb.GetActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: c.namespace, Name: id},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error when calling Control.GetActor: %w", err)
+	}
+	return actor, nil
+}
+
+// CreateActorSnapshotTag pins snapshot under tagName, a durable alias that
+// survives deleting the actor that produced it.
+func (c *Client) CreateActorSnapshotTag(ctx context.Context, tagName string, snapshot *ateapipb.ObjectRef) (*ateapipb.ActorSnapshotTag, error) {
+	client := ateapipb.NewControlClient(c.conn)
+	tag, err := client.CreateActorSnapshotTag(ctx, &ateapipb.CreateActorSnapshotTagRequest{
+		ActorSnapshotTag: &ateapipb.ActorSnapshotTag{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: tagName},
+			Snapshot: snapshot,
+			Scope:    ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_ATESPACE,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error when calling Control.CreateActorSnapshotTag: %w", err)
+	}
+	return tag, nil
+}
+
+// GetActorSnapshotTag retrieves tagName's current definition, including which
+// ActorSnapshot it points at.
+func (c *Client) GetActorSnapshotTag(ctx context.Context, tagName string) (*ateapipb.ActorSnapshotTag, error) {
+	client := ateapipb.NewControlClient(c.conn)
+	tag, err := client.GetActorSnapshotTag(ctx, &ateapipb.GetActorSnapshotTagRequest{
+		ActorSnapshotTag: &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error when calling Control.GetActorSnapshotTag: %w", err)
+	}
+	return tag, nil
+}
+
+// DeleteActorSnapshotTag removes tagName, treating an already-gone tag as success.
+func (c *Client) DeleteActorSnapshotTag(ctx context.Context, tagName string) error {
+	client := ateapipb.NewControlClient(c.conn)
+	_, err := client.DeleteActorSnapshotTag(ctx, &ateapipb.DeleteActorSnapshotTagRequest{
+		ActorSnapshotTag: &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
+	})
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("error when calling Control.DeleteActorSnapshotTag: %w", err)
+	}
+	return nil
+}
+
+// CreateActorFromSnapshotTag creates a new actor named id, already SUSPENDED and seeded
+// from the ActorSnapshot tagName points at.
+func (c *Client) CreateActorFromSnapshotTag(ctx context.Context, id, tagName string) (*ateapipb.Actor, error) {
+	client := ateapipb.NewControlClient(c.conn)
+	actor, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
+		Actor: &ateapipb.Actor{
+			Metadata:               &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: id},
+			ActorTemplateNamespace: c.namespace,
+			ActorTemplateName:      c.template,
+			SourceSnapshotTag:      &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error when calling Control.CreateActor (from snapshot tag): %w", err)
+	}
+	return actor, nil
 }
 
 // ResumeActor resumes the actor, scheduling it onto a worker. The returned
@@ -80,7 +156,7 @@ func (c *Client) CreateActor(ctx context.Context, id string) (*ateapipb.CreateAc
 func (c *Client) ResumeActor(ctx context.Context, id string) (*ateapipb.ResumeActorResponse, error) {
 	client := ateapipb.NewControlClient(c.conn)
 	resp, err := client.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
-		ActorRef: &ateapipb.ActorRef{Atespace: c.namespace, Name: id},
+		Actor: &ateapipb.ObjectRef{Atespace: c.namespace, Name: id},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error when calling Control.ResumeActor: %w", err)
@@ -88,11 +164,34 @@ func (c *Client) ResumeActor(ctx context.Context, id string) (*ateapipb.ResumeAc
 	return resp, nil
 }
 
+// DeleteActor deletes the actor regardless of its current state, treating NotFound as success.
+func (c *Client) DeleteActor(ctx context.Context, id string) error {
+	client := ateapipb.NewControlClient(c.conn)
+	_, err := client.DeleteActor(ctx, &ateapipb.DeleteActorRequest{
+		Actor:    &ateapipb.ObjectRef{Atespace: c.namespace, Name: id},
+		AnyState: true,
+	})
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("error when calling Control.DeleteActor: %w", err)
+	}
+	return nil
+}
+
+// DeleteWorker deregisters worker via a control-plane update.
+func (c *Client) DeleteWorker(ctx context.Context, worker *ateapipb.ObjectRef) error {
+	client := ateapipb.NewControlClient(c.conn)
+	_, err := client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: worker})
+	if err != nil && status.Code(err) != codes.NotFound {
+		return fmt.Errorf("error when calling Control.DeleteWorker: %w", err)
+	}
+	return nil
+}
+
 // SuspendActor suspends the actor.
 func (c *Client) SuspendActor(ctx context.Context, id string) (*ateapipb.SuspendActorResponse, error) {
 	client := ateapipb.NewControlClient(c.conn)
 	resp, err := client.SuspendActor(ctx, &ateapipb.SuspendActorRequest{
-		ActorRef: &ateapipb.ActorRef{Atespace: c.namespace, Name: id},
+		Actor: &ateapipb.ObjectRef{Atespace: c.namespace, Name: id},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error when calling Control.SuspendActor: %w", err)

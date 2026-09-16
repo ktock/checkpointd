@@ -20,13 +20,14 @@ package harnesstest
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/google/ax/internal/harness"
-	"github.com/google/ax/proto"
+	"github.com/ktock/checkpointd/internal/harness"
+	"github.com/ktock/checkpointd/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -41,45 +42,373 @@ import (
 type MockControlServer struct {
 	ateapipb.UnimplementedControlServer
 
-	mu           sync.Mutex
-	createCalls  []string
-	resumeCalls  []string
-	suspendCalls []string
+	mu                sync.Mutex
+	createCalls       []string
+	resumeCalls       []string
+	suspendCalls      []string
+	deleteCalls       []string
+	deleteWorkerCalls []string
+	getCalls          []string
+	tagCreateCalls    []string
+	tagDeleteCalls    []string
 
-	CreateErr      error  // returned from CreateActor when non-nil
-	ResumeIP       string // AteomPodIp returned from ResumeActor
-	ResumeNilActor bool   // when true, ResumeActor returns a nil Actor
+	CreateErr        error  // returned from CreateActor when non-nil
+	ResumeErr        error  // returned from ResumeActor when non-nil
+	ResumeIP         string // WorkerAssignment.WorkerPodIp returned from ResumeActor
+	ResumeWorkerName string // WorkerAssignment.Worker.Name returned from ResumeActor, if set
+	// PostRecoveryResumeIP, once set, is returned as
+	// WorkerAssignment.WorkerPodIp once DeleteWorker has been called at
+	// least once, standing in for a force-recovered actor landing on a
+	// different, healthy worker.
+	PostRecoveryResumeIP string
+	ResumeNilActor       bool  // when true, ResumeActor returns a nil Actor
+	SuspendErr           error // returned from SuspendActor when non-nil
+
+	// SuspendSucceedsWithoutAdvancing simulates SuspendActor reporting
+	// success and moving the actor to SUSPENDED without LatestSnapshot
+	// actually advancing.
+	SuspendSucceedsWithoutAdvancing bool
+
+	// actors and tags back the actor/tag RPCs below; only populated by
+	// tests that call the SetXxx/SeedSnapshotTag helpers.
+	actors map[string]*ateapipb.Actor
+	tags   map[string]*ateapipb.ObjectRef
 }
 
-func (f *MockControlServer) CreateAtespace(_ context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.CreateAtespaceResponse, error) {
-	return &ateapipb.CreateAtespaceResponse{Atespace: &ateapipb.Atespace{Name: req.GetName()}}, nil
-}
-
-func (f *MockControlServer) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.CreateActorResponse, error) {
+// SetCrashed marks name as ACTOR_STATE_CRASHED with the given
+// LatestSnapshot, so a later ResumeActor call for it fails until something
+// deletes and recreates it.
+func (f *MockControlServer) SetCrashed(name string, snapshot *ateapipb.ObjectRef) {
 	f.mu.Lock()
-	f.createCalls = append(f.createCalls, req.GetActorRef().GetName())
-	f.mu.Unlock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status: &ateapipb.ActorStatus{
+			State:          ateapipb.ActorState_ACTOR_STATE_CRASHED,
+			LatestSnapshot: snapshot,
+		},
+	}
+}
+
+// LatestSnapshot returns name's currently-tracked LatestSnapshot, or nil if
+// it was never set.
+func (f *MockControlServer) LatestSnapshot(name string) *ateapipb.ObjectRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.actors[name].GetStatus().GetLatestSnapshot()
+}
+
+// SetSuspending marks name as ACTOR_STATE_SUSPENDING with the given
+// LatestSnapshot, so a later ResumeActor call for it fails until something
+// re-invokes SuspendActor.
+func (f *MockControlServer) SetSuspending(name string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDING, LatestSnapshot: snapshot},
+	}
+}
+
+// SetResuming marks name as ACTOR_STATE_RESUMING with the given
+// LatestSnapshot, so a later ResumeActor call for it retries against
+// Substrate's own re-entrant resume workflow instead of being declined.
+func (f *MockControlServer) SetResuming(name string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RESUMING, LatestSnapshot: snapshot},
+	}
+}
+
+// SetPausing marks name as ACTOR_STATE_PAUSING, a state resumeActor's own
+// switch doesn't specially recognize, so it reports a plain retryable
+// error.
+func (f *MockControlServer) SetPausing(name string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_PAUSING, LatestSnapshot: snapshot},
+	}
+}
+
+// SetRunning marks name as ACTOR_STATE_RUNNING with the given
+// LatestSnapshot, standing in for an actor that already completed a prior
+// turn/checkpoint.
+func (f *MockControlServer) SetRunning(name string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING, LatestSnapshot: snapshot},
+	}
+}
+
+// SetDeleting marks name as ACTOR_STATE_DELETING with the given
+// LatestSnapshot, so a later ResumeActor call for it fails until something
+// re-invokes DeleteActor.
+func (f *MockControlServer) SetDeleting(name string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_DELETING, LatestSnapshot: snapshot},
+	}
+}
+
+// SetDeletingWithStuckWorker marks name as ACTOR_STATE_DELETING like
+// SetDeleting, but leaves it assigned to workerName; this mock's own
+// DeleteActor then fails until DeleteWorker clears that assignment.
+func (f *MockControlServer) SetDeletingWithStuckWorker(name string, snapshot *ateapipb.ObjectRef, workerName string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_DELETING,
+			LatestSnapshot:   snapshot,
+			WorkerAssignment: &ateapipb.WorkerAssignment{Worker: &ateapipb.ObjectRef{Name: workerName}},
+		},
+	}
+}
+
+// SeedSnapshotTag pre-populates tagName as already existing, pointing at
+// snapshot, so a test can exercise recovery finding a stale tag rather than
+// an absent one.
+func (f *MockControlServer) SeedSnapshotTag(tagName string, snapshot *ateapipb.ObjectRef) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.tags == nil {
+		f.tags = make(map[string]*ateapipb.ObjectRef)
+	}
+	f.tags[tagName] = snapshot
+}
+
+func (f *MockControlServer) CreateAtespace(_ context.Context, req *ateapipb.CreateAtespaceRequest) (*ateapipb.Atespace, error) {
+	return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: req.GetAtespace().GetMetadata().GetName()}}, nil
+}
+
+func (f *MockControlServer) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := req.GetActor().GetMetadata().GetName()
+	f.createCalls = append(f.createCalls, name)
 	if f.CreateErr != nil {
 		return nil, f.CreateErr
 	}
-	return &ateapipb.CreateActorResponse{Actor: &ateapipb.Actor{ActorId: req.GetActorRef().GetName()}}, nil
+	// An actor that already exists is AlreadyExists, never silently
+	// overwritten.
+	if _, exists := f.actors[name]; exists && req.GetActor().GetSourceSnapshotTag() == nil {
+		return nil, status.Errorf(codes.AlreadyExists, "actor %s already exists", name)
+	}
+	actor := &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}
+	// A source_snapshot_tag seeds the new actor's own LatestSnapshot from
+	// the tagged snapshot, like the real Control API's CreateActor.
+	if tagRef := req.GetActor().GetSourceSnapshotTag(); tagRef != nil {
+		snapshot, ok := f.tags[tagRef.GetName()]
+		if !ok {
+			return nil, status.Errorf(codes.NotFound, "snapshot tag %s not found", tagRef.GetName())
+		}
+		actor.Status = &ateapipb.ActorStatus{
+			State:          ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+			LatestSnapshot: snapshot,
+		}
+	}
+	if f.actors == nil {
+		f.actors = make(map[string]*ateapipb.Actor)
+	}
+	f.actors[name] = actor
+	return actor, nil
+}
+
+func (f *MockControlServer) GetActor(_ context.Context, req *ateapipb.GetActorRequest) (*ateapipb.Actor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := req.GetActor().GetName()
+	f.getCalls = append(f.getCalls, name)
+	actor, ok := f.actors[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "actor %s not found", name)
+	}
+	return actor, nil
 }
 
 func (f *MockControlServer) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
 	f.mu.Lock()
-	f.resumeCalls = append(f.resumeCalls, req.GetActorRef().GetName())
+	name := req.GetActor().GetName()
+	f.resumeCalls = append(f.resumeCalls, name)
+	state := f.actors[name].GetStatus().GetState()
+	// Carried into the response below like the real Control API does.
+	latestSnapshot := f.actors[name].GetStatus().GetLatestSnapshot()
+	resumeIP := f.ResumeIP
+	if f.PostRecoveryResumeIP != "" && len(f.deleteWorkerCalls) > 0 {
+		resumeIP = f.PostRecoveryResumeIP
+	}
+	var worker *ateapipb.ObjectRef
+	if f.ResumeWorkerName != "" {
+		worker = &ateapipb.ObjectRef{Name: f.ResumeWorkerName}
+	}
 	f.mu.Unlock()
+	if f.ResumeErr != nil {
+		return nil, f.ResumeErr
+	}
+	// Mirrors the real Control API: FailedPrecondition for CRASHED,
+	// SUSPENDING, or DELETING.
+	switch state {
+	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s is CRASHED, want SUSPENDED or PAUSED", name)
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s is SUSPENDING, want SUSPENDED or PAUSED", name)
+	case ateapipb.ActorState_ACTOR_STATE_DELETING:
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s is DELETING, want SUSPENDED or PAUSED", name)
+	}
 	if f.ResumeNilActor {
 		return &ateapipb.ResumeActorResponse{}, nil
 	}
-	return &ateapipb.ResumeActorResponse{Actor: &ateapipb.Actor{ActorId: req.GetActorRef().GetName(), AteomPodIp: f.ResumeIP}}, nil
+	respActor := &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status: &ateapipb.ActorStatus{
+			State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: resumeIP, Worker: worker},
+			LatestSnapshot:   latestSnapshot,
+		},
+	}
+	f.mu.Lock()
+	// Persisted so a later DeleteWorker call can find this actor by its
+	// assigned worker's name.
+	if actor, ok := f.actors[name]; ok {
+		if actor.Status == nil {
+			actor.Status = &ateapipb.ActorStatus{}
+		}
+		actor.Status.State = respActor.Status.State
+		actor.Status.WorkerAssignment = respActor.Status.WorkerAssignment
+	}
+	f.mu.Unlock()
+	return &ateapipb.ResumeActorResponse{Actor: respActor}, nil
+}
+
+func (f *MockControlServer) DeleteActor(_ context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := req.GetActor().GetName()
+	f.deleteCalls = append(f.deleteCalls, name)
+	// Fails while the actor still carries a worker assignment, mirroring
+	// the real Control API, until DeleteWorker clears it.
+	if actor, ok := f.actors[name]; ok && actor.GetStatus().GetWorkerAssignment() != nil {
+		return nil, status.Errorf(codes.Internal, "while terminating actor on atelet: worker unreachable")
+	}
+	delete(f.actors, name)
+	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
+}
+
+// DeleteWorker deregisters workerName, clearing the WorkerAssignment of
+// whatever actor is currently assigned to it.
+func (f *MockControlServer) DeleteWorker(_ context.Context, req *ateapipb.DeleteWorkerRequest) (*ateapipb.Worker, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	workerName := req.GetWorker().GetName()
+	f.deleteWorkerCalls = append(f.deleteWorkerCalls, workerName)
+	for _, actor := range f.actors {
+		if actor.GetStatus().GetWorkerAssignment().GetWorker().GetName() == workerName {
+			actor.Status.WorkerAssignment = nil
+			// Mirrors the real Control API: transitions the actor straight
+			// to CRASHED, like a real pod deletion would.
+			actor.Status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
+		}
+	}
+	return &ateapipb.Worker{Metadata: &ateapipb.ResourceMetadata{Name: workerName}}, nil
 }
 
 func (f *MockControlServer) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
 	f.mu.Lock()
-	f.suspendCalls = append(f.suspendCalls, req.GetActorRef().GetName())
+	name := req.GetActor().GetName()
+	f.suspendCalls = append(f.suspendCalls, name)
+	if f.SuspendErr != nil {
+		f.mu.Unlock()
+		// Left tracked as SUSPENDING, not advanced to SUSPENDED, standing
+		// in for a checkpoint that never completes.
+		return nil, f.SuspendErr
+	}
+	// A genuinely successful checkpoint always mints a fresh LatestSnapshot,
+	// like the real Control API does. SuspendSucceedsWithoutAdvancing
+	// simulates a checkpoint that moves the actor to SUSPENDED without one.
+	snapshot := &ateapipb.ObjectRef{Name: fmt.Sprintf("mock-snapshot-%d", len(f.suspendCalls))}
+	if actor, ok := f.actors[name]; ok {
+		if f.SuspendSucceedsWithoutAdvancing {
+			actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, LatestSnapshot: actor.GetStatus().GetLatestSnapshot()}
+			snapshot = actor.Status.LatestSnapshot
+		} else {
+			actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, LatestSnapshot: snapshot}
+		}
+	}
 	f.mu.Unlock()
-	return &ateapipb.SuspendActorResponse{}, nil
+	return &ateapipb.SuspendActorResponse{
+		Actor: &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}, Status: &ateapipb.ActorStatus{LatestSnapshot: snapshot}},
+	}, nil
+}
+
+func (f *MockControlServer) CreateActorSnapshotTag(_ context.Context, req *ateapipb.CreateActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tag := req.GetActorSnapshotTag()
+	name := tag.GetMetadata().GetName()
+	f.tagCreateCalls = append(f.tagCreateCalls, name)
+	// A pure create, never an upsert: a tag that already exists is
+	// AlreadyExists.
+	if f.tags == nil {
+		f.tags = make(map[string]*ateapipb.ObjectRef)
+	}
+	if _, exists := f.tags[name]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "ActorSnapshot tag %s already exists", name)
+	}
+	f.tags[name] = tag.GetSnapshot()
+	return tag, nil
+}
+
+func (f *MockControlServer) GetActorSnapshotTag(_ context.Context, req *ateapipb.GetActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := req.GetActorSnapshotTag().GetName()
+	snapshot, ok := f.tags[name]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "ActorSnapshot tag %s not found", name)
+	}
+	return &ateapipb.ActorSnapshotTag{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Snapshot: snapshot,
+	}, nil
+}
+
+func (f *MockControlServer) DeleteActorSnapshotTag(_ context.Context, req *ateapipb.DeleteActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := req.GetActorSnapshotTag().GetName()
+	f.tagDeleteCalls = append(f.tagDeleteCalls, name)
+	delete(f.tags, name)
+	return &ateapipb.ActorSnapshotTag{}, nil
 }
 
 // Calls returns copies of the recorded call lists.
@@ -89,6 +418,24 @@ func (f *MockControlServer) Calls() (create, resume, suspend []string) {
 	return append([]string(nil), f.createCalls...),
 		append([]string(nil), f.resumeCalls...),
 		append([]string(nil), f.suspendCalls...)
+}
+
+// CrashRecoveryCalls returns copies of the recorded call lists for the RPCs
+// only crash recovery uses.
+func (f *MockControlServer) CrashRecoveryCalls() (get, del, tagCreate, tagDelete []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getCalls...),
+		append([]string(nil), f.deleteCalls...),
+		append([]string(nil), f.tagCreateCalls...),
+		append([]string(nil), f.tagDeleteCalls...)
+}
+
+// DeleteWorkerCalls returns a copy of the recorded DeleteWorker call list.
+func (f *MockControlServer) DeleteWorkerCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deleteWorkerCalls...)
 }
 
 // mockHarnessServer is an in-process proto.HarnessServiceServer standing in for

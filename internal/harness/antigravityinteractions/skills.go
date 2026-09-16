@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/ax/internal/skills"
+	"github.com/ktock/checkpointd/internal/skills"
 )
 
 // SkillsSystemInstruction builds a system-instruction pointer telling the agent

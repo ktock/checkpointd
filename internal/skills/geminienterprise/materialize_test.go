@@ -18,7 +18,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/google/ax/internal/config"
+	"github.com/ktock/checkpointd/internal/config"
 )
 
 func TestSelectionFromConfig(t *testing.T) {

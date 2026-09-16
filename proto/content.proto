@@ -16,7 +16,7 @@ syntax = "proto3";
 
 package ax;
 
-option go_package = "github.com/google/ax/proto";
+option go_package = "github.com/ktock/checkpointd/proto";
 
 // TextContent represents a text content.
 message TextContent {

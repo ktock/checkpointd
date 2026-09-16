@@ -23,7 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/google/ax/internal/config"
+	"github.com/ktock/checkpointd/internal/config"
 )
 
 // SetupOptions configures asset extraction and environment setup for a Python sidecar.

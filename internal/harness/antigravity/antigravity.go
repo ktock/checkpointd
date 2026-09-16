@@ -30,12 +30,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/google/ax/internal/config"
-	"github.com/google/ax/internal/harness"
-	"github.com/google/ax/internal/pythonsidecar"
-	"github.com/google/ax/proto"
-	"github.com/google/ax/python"
 	"github.com/google/uuid"
+	"github.com/ktock/checkpointd/internal/config"
+	"github.com/ktock/checkpointd/internal/harness"
+	"github.com/ktock/checkpointd/internal/pythonsidecar"
+	"github.com/ktock/checkpointd/proto"
+	"github.com/ktock/checkpointd/python"
 )
 
 // Compile-time interface assertions.
@@ -218,6 +218,11 @@ func (e *antigravityExecution) Run(ctx context.Context, handler harness.Handler)
 
 	// 5. Stream responses and trigger callbacks
 	return harness.DrainStream(ctx, stream, e.id, handler)
+}
+
+// Checkpoint implements Execution.Checkpoint. Unimplemented on Antigravity(TODO).
+func (e *antigravityExecution) Checkpoint(ctx context.Context) error {
+	return fmt.Errorf("unimplemented")
 }
 
 // Close implements Execution.Close.

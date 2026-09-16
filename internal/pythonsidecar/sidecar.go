@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/ax/internal/config"
+	"github.com/ktock/checkpointd/internal/config"
 )
 
 // Config holds the configuration parameters for the sidecar lifecycle.
@@ -425,6 +425,3 @@ func TCPReady(addr string) func(ctx context.Context) error {
 		return nil
 	}
 }
-
-
-

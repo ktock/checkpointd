@@ -1,0 +1,48 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate for crash_recovery_agent, backing test.sh's
+# 02-crash-recovery-from-last-message durability test.
+apiVersion: ate.dev/v1alpha1
+kind: ActorTemplate
+metadata:
+  name: crash-recovery-template
+  namespace: ${NS}
+spec:
+  workerSelector:
+    matchLabels:
+      workload: ${NS}-harness
+  containers:
+    - name: crash-recovery-agent
+      image: "${CRASH_RECOVERY_AGENT_IMAGE}"
+      command:
+        - /app/crash-recovery-agent
+        - --harness-addr
+        - 0.0.0.0:80
+        - --testserver-addr
+        - testserver.${NS}.svc:8080
+        - --checkpointd-addr
+        - checkpointd-server.${NS}.svc:80
+      env:
+        - name: CHECKPOINTD_AGENT
+          value: "true"
+        - name: CHECKPOINTD_AGENT_ID
+          value: crash-recovery
+        - name: CHECKPOINTD_AGENT_CARD
+          value: |
+            name: Crash Recovery Agent
+            description: Calls echo-agent once, signals testserver, then blocks on a plain wait -- the test script force-deletes this actor's own worker pod once signaled
+            version: 1.0.0
+  snapshotsConfig:
+    location: "gs://ate-snapshots/${NS}/crash-recovery/"

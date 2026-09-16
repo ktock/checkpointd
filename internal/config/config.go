@@ -21,8 +21,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/ax/internal/harness"
-	"github.com/google/ax/internal/harness/substrate"
+	"github.com/ktock/checkpointd/internal/harness"
+	"github.com/ktock/checkpointd/internal/harness/substrate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -269,7 +269,7 @@ func (c SubstrateHarnessConfig) NewHarness(endpoint string) (harness.Harness, er
 
 // newSubstrateHarness brings up a harness that is deployed as a substrate actor.
 func newSubstrateHarness(harnessID, endpoint, namespace, template string, port int) (harness.Harness, error) {
-	sh, err := substrate.New(harnessID, endpoint, namespace, template, port)
+	sh, err := substrate.New(harnessID, endpoint, namespace, template, port, 0, substrate.ControlAPIOptions{})
 	if err != nil {
 		return nil, err
 	}

@@ -30,8 +30,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/google/ax/internal/config"
-	"github.com/google/ax/internal/skills"
+	"github.com/ktock/checkpointd/internal/config"
+	"github.com/ktock/checkpointd/internal/skills"
 )
 
 // skillManifest is the file that marks a subdirectory as a skill.

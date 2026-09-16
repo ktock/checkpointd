@@ -1,0 +1,94 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# llama-completion: a stateless llama.cpp inference server, not an Agent
+# Substrate actor -- a plain Deployment+Service (same pattern as
+# script/test-k8s/manifests/60-testserver.yaml), reached directly by
+# chat-agent and reviewer-agent over HTTP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-completion
+  namespace: checkpointd-llm-chat-demo
+  labels:
+    app: llama-completion
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llama-completion
+  template:
+    metadata:
+      labels:
+        app: llama-completion
+    spec:
+      initContainers:
+        # Downloads the model once into a shared emptyDir.
+        - name: fetch-model
+          image: curlimages/curl:8.11.0
+          command:
+            - sh
+            - -c
+            - "curl -fsSL -o /models/model.gguf https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        # Unmodified upstream CPU-only server image; no model baked in.
+        - name: llama-server
+          image: ghcr.io/ggml-org/llama.cpp:server
+          args:
+            - --model
+            - /models/model.gguf
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - --ctx-size
+            - "2048"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 3
+      volumes:
+        - name: models
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama-completion
+  namespace: checkpointd-llm-chat-demo
+spec:
+  selector:
+    app: llama-completion
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http

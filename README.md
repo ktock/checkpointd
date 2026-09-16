@@ -1,335 +1,295 @@
-# Agent Executor (AX)
+# Checkpointd: Checkpoint-based Durable Execution of Agents on Kubernetes
 
-> [!WARNING]
-> 🚧 **AX is in active early development.**
->
-> We are actively refining our core, resumption protocols,
-> and runtime specifications, which will introduce major breaking
-> changes prior to a stable release.
->
-> **Temporary Policy:** We are temporarily pausing the acceptance of external Pull Requests while we stabilize the core architecture. We warmly encourage you to open Issues for feedback and feature requests instead.
+Checkpointd runs stateful agents by automatically checkpointing their progress so crashed agents are automatically resumed from where they left off.
 
-AX, short for Agent Executor, is a distributed harness runtime.
-It dynamically provisions isolated environments from suspendable/resumable
-images to execute harnesses and agents.
-AX is designed for reliability, with native support for recovery
-and execution resumption, even in distributed setups.
+- Automatic checkpointing/resumption of stateful agents
+- Support for A2A agents
+- Sandboxed execution of agents on Kubernetes by [Agent Substrate](https://github.com/agent-substrate/substrate)
 
-## Features
+This is an experimental software.
 
-- **Distributed Runtime**: Harnesses, skills, tools, and agents can execute in isolation
-- **Resumption**: Automatic recovery from failures or interruptions
-- **Built-in Harnesses**: Support for frontier harnesses and custom implementations
-- **Portability**: Runs anywhere, scales to small and large deployments
-- **Customizability**: Bring custom environment, MCP tools, skills, instructions, and more
+This project started as a fork of Agent Executor (AX) since commit `b77731302075b3630b200af5e2cf63ac93b5f315` with adding support for agent-to-agent communication with automatic crash recovery at the message exchange boundary.
 
-Built-in consistency and resumability features:
-- **Single-Writer Architecture**: Single controller ensures consistent state management
-- **Event Log**: Durable execution state with automatic recovery
-- **Advanced Resumption**: Support for compute-layer actor resumption on compatible platforms
+## When does it checkpoint and resume an agent
 
-## Demo
+Agents are executed in a collaborative manner on checkpointd.
+Checkpointd checkpoints and suspends an agent when it emits a message to another agent.
+When the agent receives a new message, checkpointd resumes this agent from the checkpoint.
 
-[![Demo](https://i.imgur.com/ADiU1OP.png)](https://www.youtube.com/watch?v=L5Iw1IrZ6Nc)
+Assuming the following agent pseudocode:
 
-Watch our demo to see AX works when deployed on [Agent Substrate](https://github.com/agent-substrate/substrate).
+```go
+func chatAgent(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+	return func(yield func(a2a.Event, error) bool) {
+		in := text(execCtx.Message)
 
-## Overview
+		messages := buildMessages("You are a helpful, concise assistant.", history, in)
+		myAnswer, _ := complete(ctx, *llamaAddr, messages) // call LLM
+
+		reviewerAnswer, _ := askReviewer(ctx, execCtx, in, myAnswer) // (1) send a message to another agent
+
+		/* WORKER CRASH */
+
+		history = append(history, turn{User: in, Assistant: myAnswer})
+		conversation = append(conversation, fmt.Sprintf("User: %s\nAssistant: %s\nReviewer: %s", in, myAnswer, reviewerAnswer))
+		yield(&a2a.Task{
+			Status: a2a.TaskStatus{
+				State:   a2a.TaskStateInputRequired,
+				Message: a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(strings.Join(conversation, "\n"))),
+			},
+		}, nil) // -- (2) return a response
+	}
+}
+```
+
+`askReviewer` sends the user's input and this agent's own answer to `reviewer-agent` for a second opinion and returns its response.
+Once the control reached (1) and successfully sent a message, this agent is checkpointed and suspended.
+When this agent receives a response from the reviewer agent, checkpointd resumes this agent from (1) directly from the checkpoint, without replaying code before from the beginning.
+If this agent crashes before it reaches the next message send (2), checkpointd retries it from (1), without losing the progress before it.
+
+See "How does it work" section for details.
+
+## Quick Start
+
+- Prerequisites: `docker`, `kind`, `kubectl`, `go`, `git`
+
+[`examples/llm-chat-demo`](./examples/llm-chat-demo) runs two agents and a stateless [llama.cpp](https://github.com/ggml-org/llama.cpp) completion server (SmolLM2 135M on CPU) in the cluster.
+
+- `chat-agent` ([`main.go`](./examples/llm-chat-demo/chat-agent/main.go)) is the agent the client talks to. It keeps a conversation log across turns (a `conversation` Go variable in memory), answers each turn itself via the llama.cpp completion server, and asks `reviewer-agent` for a second opinion on its own answer.
+- `reviewer-agent` ([`main.go`](./examples/llm-chat-demo/reviewer-agent/main.go)) gives that second opinion, keeping its own separate conversation log the same way.
+
+Start a kind cluster with Agent Substrate, checkpointd, and both demo agents deployed:
+
+```sh
+./examples/llm-chat-demo/setup.sh
+```
+
+Drive the whole scenario.
+
+- send a couple of messages to `chat-agent`
+- restart of one kind worker node
+- one more message: the reply's own conversation log still carries every message from before the crash
+
+```sh
+./examples/llm-chat-demo/demo.sh
+```
+
+<details>
+<summary>The last message will be like the following. The conversation log is still preserved in memory after node restart.</summary>
+
+```
+[llm-chat-demo]   running: /tmp/checkpointd-llm-chat-demo-a2a-cli.H17igG54/a2a --transport jsonrpc --timeout 120s send http://127.0.0.1:44463/agents/chat-agent/ -o json --task 01a0a553-43fc-7dcf-826b-b30c26144775 --tenant b92569bbabce4377 What is the weather?
+  reply:
+    Assistant: The weather is sunny.
+    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    
+    "The weather is sunny."
+    
+    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "The weather is" as it's not necessary to convey
+    
+    --- conversation log from process memory ---
+    User: Hi, I'm Foo.
+    Assistant: Hi, I'm Foo.
+    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    
+    "Hi, I'm Foo.
+    
+    I'm glad you asked about me."
+    
+    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase
+    ------------------------
+    User: What is your name?
+    Assistant: My name is Foo.
+    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    
+    "My name is Foo."
+    
+    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "My name is" as it's not necessary to
+    ------------------------
+    User: What is the weather?
+    Assistant: The weather is sunny.
+    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    
+    "The weather is sunny."
+    
+    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "The weather is" as it's not necessary to convey
+[llm-chat-demo] PASS -- chat-agent's full conversation log survived every kind worker node restarting, checkpointd-server included.
+```
+</details>
+
+When you're done, tear the cluster down.
+
+```sh
+./examples/llm-chat-demo/cleanup.sh
+```
+
+See [`./examples/llm-chat-demo`](./examples/llm-chat-demo) for actual codes.
+See [`./docs/deployment.md`](./docs/deployment.md) for deployment details.
+
+## Getting Started
+
+- Requirement
+  - Kubernetes 1.33+
+  - [Agent Substrate](https://github.com/agent-substrate/substrate) (tested with `d909d690532b`)
+
+### Building checkpointd binary using make
+
+```
+make build
+```
+
+### Building checkpointd container image with docker
+
+```
+IMAGE_TAG=checkpointd
+docker build --target checkpointd -f cmd/Dockerfile -t $IMAGE_TAG .
+```
+
+### Deployment
+
+See [`./docs/deployment.md`](./docs/deployment.md)
+
+### Available flags
+
+See [`./docs/flags.md`](./docs/flags.md)
+
+## A2A operations API
+
+Checkpointd exposes all agents' A2A [core operation](https://a2a-protocol.org/latest/specification/#31-core-operations) JSON-RPC endpoints (SendMessage/GetTask/ListTasks) on `/agents/{id}/`.
+So an unmodified a2a client CLI can send a message to an agent, get the status of a task and list tasks via that endpoint.
+
+> NOTE: standard A2A agent exposes its agent card and the operation APIs without relying on an aggregated endpoint such as checkpointd. In checkpointd, each agent isn't always running and it is suspended and resumed by checkpointd. So checkpointd serves the always accessible endpoints for agents on their behalf.
+
+## How does it work
+
+### Checkpoint and resumption timing
+
+Agents are executed in a collaborative manner on checkpointd.
+Checkpointd relays A2A messages among agents by managing their checkpoints on Substrate.
+Conceptually, checkpointd repeats the following turn for each message:
+
+1. checkpointd logs the input message to the event log
+1. checkpointd resumes the message's target agent from the last checkpoint on Substrate
+1. checkpointd passes the A2A message to the target agent
+1. An agent returns a new A2A message to checkpointd
+1. checkpointd checkpoints and suspends the agent on Substrate
+1. checkpointd commits that message to the event log
+
+If any of the steps before 6 failed, checkpointd retries from the step 2.
+For example, if the agent couldn't pass a message to checkpointd (e.g. due to process/worker crash), checkpointd retries this turn.
+If checkpointd itself crashed before committing a message, checkpointd restarts by recovering the loop's state using the event log then it retries the last failed turn.
+An agent's checkpoint is potentially resumed more than once until it succeeds so it should be implemented to be safe to retry.
+
+For example, the sequence of an agent sending a request to another and receiving the response is the following.
 
 ```mermaid
-%%{init: {"flowchart": {"diagramPadding": 80}}}%%
-graph LR
-    Client
+sequenceDiagram
+    participant Client
+    participant CKPT as checkpointd
+    participant EVLOG as Event Log
+    participant SUB as Substrate
+    participant AGA as Agent A
+    participant AGB as Agent B
 
-    subgraph Cluster[" "]
-        Server["AX Server<br/>(multi-tenant)"]
-        DB["Event Log <br/>Storage"]
-        ControlService["Agent Substrate"]
-        Actor["AX Agent or Harness<br/>(session-tenant)"]
-    end
+    Client->>CKPT: SendMessage (to Agent A)
 
-    SnapshotService["Snapshots"]
-    Models
-    MCPServer["MCP server"]
+    Note over CKPT,EVLOG: Turn 1: Agent A's own turn
+    CKPT->>EVLOG: log input message
+    CKPT->>SUB: Resume/Create actor A
+    SUB-->>CKPT: actor A ready
+    CKPT->>AGA: deliver message
+    activate AGA
+    AGA->>AGA: process: code calls SendMessage(to Agent B)
+    AGA-->>CKPT: turn output: hop to Agent B
+    deactivate AGA
+    Note right of AGA: Agent A's whole process is checkpointed<br/>right here, mid-call -- safe to retry even<br/>if this worker crashes before it resumes
+    CKPT->>SUB: Checkpoint (SuspendActor) actor A
+    SUB-->>CKPT: checkpointed
+    CKPT->>EVLOG: commit Agent A's turn (hop to Agent B)
 
-    Client <-->|resumable stream| Server
-    Server <-->|scan/append| DB
-    Server --> ControlService
-    ControlService -->|resume/suspend| Actor
-    Server <-->|resumable stream| Actor
-    ControlService <-->|read/write| SnapshotService
-    Actor -.-> Models
-    Actor --> MCPServer
+    Note over CKPT,EVLOG: Turn 2: Agent B's own turn
+    CKPT->>EVLOG: log input (Agent A's message)
+    CKPT->>SUB: Resume/Create actor B
+    SUB-->>CKPT: actor B ready
+    CKPT->>AGB: deliver message
+    activate AGB
+    AGB->>AGB: process
+    AGB-->>CKPT: turn output: reply to Agent A
+    deactivate AGB
+    CKPT->>SUB: Checkpoint (SuspendActor) actor B
+    SUB-->>CKPT: checkpointed
+    CKPT->>EVLOG: commit Agent B's turn (reply to Agent A)
+
+    Note over CKPT,EVLOG: Turn 3: Agent A resumes with Agent B's reply
+    CKPT->>EVLOG: log input (Agent B's reply)
+    CKPT->>SUB: Resume actor A from its checkpoint
+    SUB-->>CKPT: actor A resumed
+    CKPT->>AGA: deliver Agent B's reply
+    activate AGA
+    AGA->>AGA: SendMessage(to Agent B) call returns:<br/>processing continues to completion
+    AGA-->>CKPT: turn output: final reply (no further hop)
+    deactivate AGA
+    CKPT->>SUB: Checkpoint (SuspendActor) actor A
+    SUB-->>CKPT: checkpointed
+    CKPT->>EVLOG: commit Agent A's final turn
+
+    CKPT-->>Client: final A2A response
 ```
 
-As agents evolve from simple assistants to autonomous long running workers,
-developers need a robust runtime to manage state, ensure reliability,
-and audit execution. As we are moving away from monolithic agents towards
-distributed harnesses where tools, skills and agents are deployed as
-isolated actors, a distributed runtime with dynamically spawned isolated
-workers becomes a necessity. AX provides the foundational layer to fill these gaps.
+### Agent communication
 
-While compute-agnostic, AX is aiming to provide the best
-experience on Kubernetes.
+Each agent has its own ID.
 
-We expect every sophisticated agentic application will need the
-capabilities provided by AX.
-We are building this layer as a widely available foundation,
-enabling developers to focus on building their applications rather
-than infrastructure. We decided to build this project in public to
-validate every design decision before a stable release is cut.
-We highly encourage you to give us feedback.
+Checkpointd exposes all agents' [AgentCards](https://a2a-protocol.org/latest/specification/#441-agentcard) on `/agents/{id}/.well-known/agent-card.json`.
+In an agent's code, another agent's card can be fetched using the a2a-go's standard client helper (`agentcard.DefaultResolver.Resolve()`).
+This AgentCard's `supportedInterface` field contains the target agent's ID as `checkpointd:<ID>` URL.
 
-## Installation
+Once the AgentCard is acquired, our custom transport plugin uses this to identify the callee agent.
+On each `client.SendMessage()`, the plugin gets the callee agent's ID from the card then passes the following JSON object to checkpointd.
+See [`./internal/hop/hop.go`](./internal/hop/hop.go) for the exact structure.
 
-Install the ax CLI directly from the repository:
-
-```bash
-go install github.com/google/ax/cmd/ax@latest
+```json
+{
+  "from": "chat-agent",
+  "to": "reviewer-agent",
+  "correlation": "129222c0-ea8c-41b4-8c94-6995838b0a93",
+  "stepId": "129222c0-ea8c-41b4-8c94-6995838b0a93",
+  "data": {
+    "message": {
+      "messageId": "01a0a536-b1a9-76ad-a293-016f2e1bfeb8",
+      "parts": [
+        {
+          "text": "User asked: Hi\nAssistant's answer: Hey, just checking in! I'm working on this project and need some help with a project report. Can you take a look?\nWhat's your take?"
+        }
+      ],
+      "role": "ROLE_USER"
+    },
+    "type": "message"
+  }
+}
 ```
 
-### Verify Installation
+> This is an envelope captured from [`examples/llm-chat-demo`](./examples/llm-chat-demo): `chat-agent`'s own transport plugin sending a question to `reviewer-agent`.
 
-Check that ax is installed correctly:
+Checkpointd relays it to the callee with checkpointing and resumption, as described in the above section.
+In the callee agent, our custom transport extracts the message contents from this object then passes it to the user's agent code.
 
-```bash
-ax --help
-```
+## Additional resources
 
-You should see the ax CLI usage information.
-
-### Kubernetes
-
-AX is natively supported on
-[Agent Substrate](https://github.com/agent-substrate/substrate)
-on Kubernetes and it's the recommended deployment option for production
-use. For more details on setup and configuration, see the
-[deployment guide](./manifests/README.md).
-Read more about [this new layer](https://cloud.google.com/blog/products/containers-kubernetes/bringing-you-agent-sandbox-on-gke-and-agent-substrate)
-that provides higher density to agentic workloads on Kubernetes.
-
-## Authentication
-
-The built-in Antigravity harness supports Google AI Studio and Vertex AI.
-
-For Google AI Studio, set a Gemini API key:
-
-```bash
-export GEMINI_API_KEY="your-api-key"
-```
-
-For Vertex AI, configure Application Default Credentials and the target project
-and location:
-
-```bash
-gcloud auth application-default login
-export GOOGLE_CLOUD_PROJECT="your-project-id"
-export GOOGLE_CLOUD_LOCATION="us-central1"
-export GOOGLE_GENAI_USE_VERTEXAI=true
-```
-
-## Quickstart
-
-The CLI starts the built-in Antigravity harness automatically. No separate harness server setup is required.
-
-```bash
-# Using the checked-in ax.yaml, which sets Antigravity as the default harness.
-ax --input "Can you list this directory?"
-
-# Executing with an AX server
-ax --input "Can you list this directory?" --server localhost:8494
-```
-
-Conversations can be continued any time:
-
-```bash
-ax --conversation d85a4b4e-c53b-4c84-b879-f10d905bce40 \
-   --input "Show me the contents of README.md"
-```
-
-Instead of running the default harness, you can start executing
-any registered harness:
-
-```bash
-ax --input "Can you write me a simple HTTP server in Python?"
-```
-
-If anything goes wrong during the execution of a harness,
-you can resume an incomplete execution in a conversation:
-```bash
-ax --conversation edf98ef5-4bb1-4a9e-a091-3a77e03727e6 --resume
-```
-
-
-## Usage
-
-Execute a new conversation or resume an existing one. If no conversation ID is provided, a new UUID will be generated.
-
-```bash
-ax \
-    [--input <text>] \
-    [--conversation <id>] \
-    [--agent <id>] \
-    [--agent-config <json>] \
-    [--agent-config-file <file.json>] \
-    [--server <address>] \
-    [--config <file>] \
-    [--resume]
-```
-
-Options:
-- `--agent`: Agent ID (optional, default agent is used if not specified)
-- `--agent-config`: Per-request agent configuration as an inline JSON string (mutually exclusive with `--agent-config-file`)
-- `--agent-config-file`: Path to a JSON file with per-request agent configuration
-- `--config`: Path to YAML configuration file (only used with a local built-in AX server) (default "ax.yaml")
-- `--conversation`: Conversation ID (optional, generates UUID if not provided)
-- `--input`: Input message to send (optional)
-- `--resume`: Resume a conversation without inputs
-- `--server`: gRPC controller server address (if specified, connects to remote server; otherwise runs with a local built-in AX server)
-
-**Examples:**
-
-```bash
-# Execute a new execution
-ax --input "Hello agents!"
-
-# Resume an existing execution with new input
-ax --conversation a53d4db3-1165-4925-87da-be6c72bbdeb1 --input "Ok, now let's do something else..."
-
-# Execute using server mode
-ax --server localhost:8494 --input "Hello agents!"
-
-# Execute with per-request agent config
-ax --agent-config '{"system_instructions":"Answer in one sentence.","model":"gemini-3.5-flash"}' \
-   --input "Explain durable execution."
-
-# To keep the same JSON in a file, use `--agent-config-file` instead:
-ax --agent-config-file antigravity.json --input "Explain durable execution."
-```
-
-### Serve
-
-Run the AX controller as a gRPC server. Loads configuration from a YAML file (default: ax.yaml).
-
-```bash
-ax serve [--config <path>]
-```
-
-Options:
-- `--config`: Path to YAML configuration file (default "ax.yaml")
-
-Example configuration file (`ax.yaml`):
-```yaml
-version: v1alpha
-
-server:
-  address: ":8494"
-
-eventlog:
-  sqlite:
-    filename: "eventlog/log.sqlite"
-```
-
-Example:
-```bash
-# Start server with default config (ax.yaml)
-ax serve
-
-# Start server with custom config
-ax serve --config my-config.yaml
-```
-
-## Extensions
-
-### Harnesses
-
-AX provides built-in harnesses (e.g. Antigravity) but you can bring your
-own harness implementation by implementing `HarnessService`. On supported
-compute services (e.g. Agent Substrate), AX automatically runs the
-harness in isolation with automatic resumption and suspension.
-
-Traditional agents (e.g. tool use or workflow agents), or
-language models can be implemented as harnesses.
-
-### Skills
-
-Built-in harnesses like Antigravity includes built-in support for
-Agent Skills. See [Skills](examples/skills) for more.
-
-### MCP Tools
-
-Built-in harnesses like Antigravity provides support for discovering
-and making calls to MCP tools when they are configured.
-
-## What AX is NOT?
-* A managed service. AX is self-hosted and not a managed service.
-  We aim to make it easy for users to deploy and operate it on
-  their Kubernetes clusters.
-* An agentic framework. AX is agnostic of the framework used
-  to build agents.
+- [`./examples/llm-chat-demo`](./examples/llm-chat-demo): Example checkpointd deployment (see Quick Start above)
+- [`./docs/caveats.md`](./docs/caveats.md): caveats
+- [`./docs/session.md`](./docs/session.md): resource lifecycle management
+- [`./docs/deployment.md`](./docs/deployment.md): Deployment overview using KinD
+- [`./docs/agents.md`](./docs/agents.md): How to integrate a2a-go with checkpointd
+- [`./docs/flags.md`](./docs/flags.md): Available flags
 
 ## Roadmap
 
-Below is an overview of our upcoming features and planned changes:
+- Implement Antigravity and python path (currently tested only on Substrate)
+- Support replication
+- Support optional and non-MUST level A2A features
 
-1. Support for elicitation
-1. Improvements to resumption protocols
-1. Trajectory exposition
-1. Better telemetry exposition
-1. Integrations with Google registries, networking policies, and more
-1. Introduction of a `FilesystemService` for file system operations
+## Acknowledgement
 
-## Contributing
-
-Please refer to the [CONTRIBUTING.md](CONTRIBUTING.md) guide for instructions
-on how to contribute to this project.
-
-We are currently undergoing a significant architectural redesign, and external contributions are temporarily paused.
-However, in the meantime, we warmly encourage you to file bugs and
-send feature requests.
-
-## History
-
-Over the years, teams across Google built and operated several
-distributed execution engines. As these systems evolved, certain
-architectural patterns consistently stood the test of time.
-The teams realized they were repeatedly solving similar
-orchestration problems, prompting the push to extract these
-lessons into common runtime layer.
-
-While this common layer was taking shape, the AI landscape underwent
-a massive shift. Applications were transitioning from
-statless tool use agents to autonomous, long-running, self improving
-agents that often need isolated resumable execution environments.
-Also, from an efficiency standpoint, agentic workloads are inherently bursty.
-An agent might compute intensively for a minute, then sit idle for
-hours or days awaiting human approval. Keeping a stateful actor active
-during these long idle periods is highly inefficient and cost-prohibitive
-at scale.
-Over the last 10 years, Kubernetes has become the standard for
-large scale job orchestration, but it was fundamentally designed for
-stateless microservices or predictable batch jobs --
-not for suspending and resuming stateful, sandboxed agent actors.
-
-Driven by these dual challenges, we decided to build a robust, common
-agentic orchestrator designed specifically for the new compute
-layers we are developing on Kubernetes. Our goal is to ease
-the productionization of agents, allowing developers
-and researchers to focus on building and evaluating their
-applications rather than dealing with underlying infrastructure.
-
-AX is developed and maintained by the team actively working on
-Google's internal runtime. Although the two projects operate
-at different layers today, we are applying our knowledge
-and insights to AX in the public domain every day.
-
-## Acknowledgements
-
-We thank Google DeepMind for their earlier work in distributed harnesses which
-heavily influenced AX.
-We thank the Google Kubernetes Engine team for their deep contributions
-regarding isolation, resumption and job scheduling.
-
-## License
-
-Apache 2.0
+- This project is a fork of [Agent Executor (AX)](https://github.com/google/ax) since commit `b77731302075b3630b200af5e2cf63ac93b5f315`.
+- This project depends on [Agent Substrate](https://github.com/agent-substrate/substrate) for checkpointing/resumption/sandboxing of agents.
