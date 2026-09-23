@@ -28,6 +28,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	config "github.com/ktock/checkpointd/internal/config/checkpointd"
+	"github.com/ktock/checkpointd/internal/controller/eventlog"
 	"github.com/ktock/checkpointd/internal/harness"
 	"github.com/ktock/checkpointd/internal/hop"
 )
@@ -42,7 +43,6 @@ func TestServer_RealClientOverJSONRPC(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
 	cards := newAgentCardStore(map[string]*config.AgentCardConfig{
 		"a": {Name: "Agent A", Description: "test agent"},
@@ -52,7 +52,7 @@ func TestServer_RealClientOverJSONRPC(t *testing.T) {
 	// with the correct base URL for each agent's AgentCard from the start.
 	ts := httptest.NewUnstartedServer(nil)
 	baseURL := "http://" + ts.Listener.Addr().String()
-	ts.Config = &http.Server{Handler: buildServerMux(cards, baseURL, c, el, store, newTaskRegistry())}
+	ts.Config = &http.Server{Handler: buildServerMux(cards, baseURL, c, el, store, newTestRegistry(t), "pod-1", "uid-1", nil)}
 	ts.Start()
 	defer ts.Close()
 
@@ -125,10 +125,9 @@ func TestServer_RealClientOverJSONRPC(t *testing.T) {
 // can be deployed before its agents exist).
 func TestServer_ReadyEndpoint(t *testing.T) {
 	c, el, store := newTestServerController(t, nil)
-	defer c.Close()
 
 	cards := newAgentCardStore(nil)
-	ts := httptest.NewServer(buildServerMux(cards, "http://ignored", c, el, store, newTaskRegistry()))
+	ts := httptest.NewServer(buildServerMux(cards, "http://ignored", c, el, store, newTestRegistry(t), "pod-1", "uid-1", nil))
 	defer ts.Close()
 
 	get := func() int {
@@ -156,6 +155,43 @@ func TestServer_ReadyEndpoint(t *testing.T) {
 	}
 }
 
+// TestServer_HealthzEndpoint confirms /healthz -- checkpointd's
+// livenessProbe target -- reflects real database reachability: 200 while
+// the DB is up, 503 once it's closed out from under the store, simulating
+// the wedged-connection case a livenessProbe is meant to catch.
+func TestServer_HealthzEndpoint(t *testing.T) {
+	c, el, store := newTestServerController(t, nil)
+
+	cards := newAgentCardStore(nil)
+	ts := httptest.NewServer(buildServerMux(cards, "http://ignored", c, el, store, newTestRegistry(t), "pod-1", "uid-1", nil))
+	defer ts.Close()
+
+	get := func() int {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/healthz")
+		if err != nil {
+			t.Fatalf("GET /healthz: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := get(); got != http.StatusOK {
+		t.Errorf("GET /healthz with the DB reachable = %d, want %d", got, http.StatusOK)
+	}
+
+	db, _, ok := eventlog.SQLDB(el)
+	if !ok {
+		t.Fatal("eventlog.SQLDB: not a SQL-backed EventLog")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing the DB out from under the store: %v", err)
+	}
+	if got := get(); got != http.StatusServiceUnavailable {
+		t.Errorf("GET /healthz with the DB closed = %d, want %d", got, http.StatusServiceUnavailable)
+	}
+}
+
 // TestServer_GetTask_AcceptsSnakeCaseHistoryLength (CORE-HIST-002) confirms
 // checkTransportPreconditions rewrites a GetTask params.history_length
 // (snake_case, what the A2A TCK's own client sends) to the spec-mandated
@@ -166,14 +202,13 @@ func TestServer_GetTask_AcceptsSnakeCaseHistoryLength(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
 	cards := newAgentCardStore(map[string]*config.AgentCardConfig{
 		"a": {Name: "Agent A", Description: "test agent"},
 	})
 	ts := httptest.NewUnstartedServer(nil)
 	baseURL := "http://" + ts.Listener.Addr().String()
-	ts.Config = &http.Server{Handler: checkTransportPreconditions(buildServerMux(cards, baseURL, c, el, store, newTaskRegistry()))}
+	ts.Config = &http.Server{Handler: checkTransportPreconditions(buildServerMux(cards, baseURL, c, el, store, newTestRegistry(t), "pod-1", "uid-1", nil))}
 	ts.Start()
 	defer ts.Close()
 
@@ -242,7 +277,7 @@ func TestCheckTransportPreconditions_Version(t *testing.T) {
 	_, el, store := newTestServerController(t, nil)
 	ts := httptest.NewUnstartedServer(nil)
 	baseURL := "http://" + ts.Listener.Addr().String()
-	mux := buildServerMux(cards, baseURL, nil, el, store, newTaskRegistry())
+	mux := buildServerMux(cards, baseURL, nil, el, store, newTestRegistry(t), "pod-1", "uid-1", nil)
 	ts.Config = &http.Server{Handler: checkTransportPreconditions(mux)}
 	ts.Start()
 	defer ts.Close()
@@ -304,7 +339,7 @@ func TestCheckTransportPreconditions_ContentType(t *testing.T) {
 	_, el, store := newTestServerController(t, nil)
 	ts := httptest.NewUnstartedServer(nil)
 	baseURL := "http://" + ts.Listener.Addr().String()
-	mux := buildServerMux(cards, baseURL, nil, el, store, newTaskRegistry())
+	mux := buildServerMux(cards, baseURL, nil, el, store, newTestRegistry(t), "pod-1", "uid-1", nil)
 	ts.Config = &http.Server{Handler: checkTransportPreconditions(mux)}
 	ts.Start()
 	defer ts.Close()
@@ -330,7 +365,7 @@ func TestCheckTransportPreconditions_RejectsStreaming(t *testing.T) {
 	_, el, store := newTestServerController(t, nil)
 	ts := httptest.NewUnstartedServer(nil)
 	baseURL := "http://" + ts.Listener.Addr().String()
-	mux := buildServerMux(cards, baseURL, nil, el, store, newTaskRegistry())
+	mux := buildServerMux(cards, baseURL, nil, el, store, newTestRegistry(t), "pod-1", "uid-1", nil)
 	ts.Config = &http.Server{Handler: checkTransportPreconditions(mux)}
 	ts.Start()
 	defer ts.Close()

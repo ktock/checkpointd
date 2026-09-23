@@ -250,7 +250,7 @@ func taskReply(in *hop.Envelope, from, to string, state a2a.TaskState, data stri
 func testRelay(ctx context.Context, t *testing.T, c *controller.Controller, el eventlog.EventLog, store *sqlTaskStore, agent, bootstrapData string) (string, *bookkeeping, error) {
 	t.Helper()
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, agent, bootstrapData)
-	bk, err := newServerSession(ctx, store, el, agent, bootstrap)
+	bk, err := newServerSession(ctx, store, el, agent, "pod-1", "uid-1", bootstrap)
 	if err != nil {
 		return "", nil, err
 	}
@@ -329,7 +329,6 @@ func TestRelay_FreshBootstrapAndRelay(t *testing.T) {
 		return envNew(a2a.MessageRoleUser, "b", "", "from-b:"+textOf(inMessage(in))), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	got, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed")
 	if err != nil {
@@ -380,7 +379,6 @@ func TestRelay_StateSurvivesRelayHop(t *testing.T) {
 		return env, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	got, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed")
 	if err != nil {
@@ -414,7 +412,6 @@ func TestRelay_DataPartSurvivesRelayHop(t *testing.T) {
 		return envNew(a2a.MessageRoleUser, "b", "", fmt.Sprintf("status=%v id=%v", data["status"], data["id"])), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	got, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed")
 	if err != nil {
@@ -443,7 +440,6 @@ func TestRelay_SelfLoop(t *testing.T) {
 		return reply, nil
 	}}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
 	got, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed")
 	if err != nil {
@@ -483,7 +479,6 @@ func TestRelay_EventsBySessionID_RevisitedAgentNotDuplicated(t *testing.T) {
 		return replyFrom(in, "b", "a", "from-b:"+textOf(inMessage(in))), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	ctx := context.Background()
 	_, bk, err := testRelay(ctx, t, c, el, store, "a", "seed")
@@ -535,7 +530,6 @@ func TestRetryExec_RecoversFromTransientFailure(t *testing.T) {
 		},
 	}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": h})
-	defer c.Close()
 
 	got, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed")
 	if err != nil {
@@ -590,13 +584,11 @@ func TestRelay_TwoIndependentRunsDoNotShareAnActor(t *testing.T) {
 	}}
 
 	c1, el1, store1 := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c1.Close()
 	if _, _, err := testRelay(context.Background(), t, c1, el1, store1, "a", "seed1"); err != nil {
 		t.Fatalf("testRelay (run 1): %v", err)
 	}
 
 	c2, el2, store2 := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c2.Close()
 	if _, _, err := testRelay(context.Background(), t, c2, el2, store2, "a", "seed2"); err != nil {
 		t.Fatalf("testRelay (run 2): %v", err)
 	}
@@ -618,7 +610,6 @@ func TestRelay_CleansUpVisitedActorsOnCompletion(t *testing.T) {
 		return envNew(a2a.MessageRoleAgent, "b", "", "from-b:"+textOf(inMessage(in))), nil
 	}}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	if _, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed"); err != nil {
 		t.Fatalf("testRelay: %v", err)
@@ -648,6 +639,143 @@ func TestRelay_CleansUpVisitedActorsOnCompletion(t *testing.T) {
 	}
 }
 
+// TestDriveRelayLoop_StopsWhenSessionMarkedTerminatingMidFlight confirms a
+// session marked TERMINATING by a concurrent, cross-instance CancelTask
+// is noticed by the actively-driving relay loop's own next recordTaskStatus
+// check -- which stops relaying immediately, not waiting for a natural terminal
+// reply that might never come -- and cleans up every actor visited so far.
+func TestDriveRelayLoop_StopsWhenSessionMarkedTerminatingMidFlight(t *testing.T) {
+	var store *sqlTaskStore
+	var sessionID string
+	aCalls, bCalls := 0, 0
+	a := &fakeDeleterHarness{fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		aCalls++
+		if aCalls == 2 {
+			// Simulates a CancelTask that reached a different instance
+			// while this hop was in flight: durably marks the session
+			// TERMINATING out from under the still-actively-driving loop.
+			if err := store.MarkTerminating(context.Background(), sessionID); err != nil {
+				t.Fatalf("MarkTerminating: %v", err)
+			}
+		}
+		// Keeps self-continuing via b -- if the loop failed to notice
+		// TERMINATING and stop, it would keep going indefinitely.
+		return envNew(a2a.MessageRoleAgent, "a", "b", "from-a:"+textOf(inMessage(in))), nil
+	}}}
+	b := &fakeDeleterHarness{fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		bCalls++
+		return envNew(a2a.MessageRoleAgent, "b", "a", "from-b:"+textOf(inMessage(in))), nil
+	}}}
+	c, el, s := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
+	store = s
+	ctx := context.Background()
+
+	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID = bk.sessionID
+
+	if _, err := runRelayLoop(ctx, c, el, bk, "a", bootstrap, func(*hop.Envelope) {}); err != nil {
+		t.Fatalf("runRelayLoop: %v", err)
+	}
+
+	if aCalls != 2 {
+		t.Errorf("agent a invoked %d times, want exactly 2 (loop must stop right after detecting TERMINATING, not keep relaying)", aCalls)
+	}
+	if bCalls != 1 {
+		t.Errorf("agent b invoked %d times, want exactly 1 (the third hop, a's second reply routing back to b, must never happen)", bCalls)
+	}
+
+	row, err := store.GetSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.state != sessionStateTerminated {
+		t.Errorf("session state = %q, want %q (finishTermination should have run)", row.state, sessionStateTerminated)
+	}
+
+	if len(a.deleted) != 1 {
+		t.Errorf("agent a: DeleteActor called %d times, want 1", len(a.deleted))
+	}
+	if len(b.deleted) != 1 {
+		t.Errorf("agent b: DeleteActor called %d times, want 1", len(b.deleted))
+	}
+}
+
+// TestCleanupActors_IncludesActorDispatchedButNeverReplied confirms an
+// actor whose turn was interrupted before it ever replied still
+// gets cleaned up.
+func TestCleanupActors_IncludesActorDispatchedButNeverReplied(t *testing.T) {
+	a := &fakeDeleterHarness{fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		t.Fatal("agent a must never actually be invoked -- only its dispatch/reply records are simulated directly")
+		return nil, nil
+	}}}
+	b := &fakeDeleterHarness{fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		t.Fatal("agent b must never actually be invoked -- only its dispatch record is simulated directly")
+		return nil, nil
+	}}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
+	ctx := context.Background()
+
+	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actorA := actorConv(bk.sessionID, "a")
+	actorB := actorConv(bk.sessionID, "b")
+	// "a"'s turn was dispatched and completed normally (LogInputs, then a
+	// reply, then the COMPLETED marker).
+	if _, err := el.Append(ctx, &proto.StepEvent{
+		ConversationId: actorA, AgentId: "a", SessionId: bk.sessionID,
+		Steps: []*proto.Step{userStep("seed")}, State: proto.State_STATE_PENDING,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := el.Append(ctx, &proto.StepEvent{
+		ConversationId: actorA, SessionId: bk.sessionID,
+		Steps: []*proto.Step{textStep("a's reply")}, State: proto.State_STATE_PENDING,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := el.Append(ctx, &proto.StepEvent{
+		ConversationId: actorA, SessionId: bk.sessionID, State: proto.State_STATE_COMPLETED,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// "b"'s turn was dispatched (LogInputs committed, exactly as
+	// Controller.Exec does before ever running the harness) but its own
+	// relay hop was interrupted before it ever replied.
+	if _, err := el.Append(ctx, &proto.StepEvent{
+		ConversationId: actorB, AgentId: "b", SessionId: bk.sessionID,
+		Steps: []*proto.Step{userStep("from a")}, State: proto.State_STATE_PENDING,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	actors, err := visitedActorsFromHistory(ctx, el, bk.sessionID)
+	if err != nil {
+		t.Fatalf("visitedActorsFromHistory: %v", err)
+	}
+	if actors[actorA] != "a" {
+		t.Errorf("visitedActorsFromHistory missing/wrong entry for a: %v", actors)
+	}
+	if actors[actorB] != "b" {
+		t.Errorf("visitedActorsFromHistory missing actor b (dispatched but never replied): %v", actors)
+	}
+
+	cleanupActors(ctx, c, bk)
+	if len(a.deleted) != 1 {
+		t.Errorf("agent a: DeleteActor called %d times, want 1", len(a.deleted))
+	}
+	if len(b.deleted) != 1 {
+		t.Errorf("agent b: DeleteActor called %d times, want 1 -- it was dispatched to but never replied, and must still be cleaned up, not leaked", len(b.deleted))
+	}
+}
+
 // TestRelay_CleanupContinuesAfterCrashTagDeleteFails confirms
 // cleanupActors treats a failed DeleteCrashRecoveryTag the same
 // best-effort way it already treats a failed DeleteActor: logged and
@@ -660,7 +788,6 @@ func TestRelay_CleanupContinuesAfterCrashTagDeleteFails(t *testing.T) {
 		return envNew(a2a.MessageRoleAgent, "b", "", "from-b:"+textOf(inMessage(in))), nil
 	}}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
 	if _, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed"); err != nil {
 		t.Fatalf("testRelay: %v", err)
@@ -779,7 +906,6 @@ func TestEstablishRelayState_ResumesTerminalReplyLoggedButNotCompleted(t *testin
 		return &hop.Envelope{From: "a", To: "", StepID: in.StepID, Data: hop.Data{Message: &msg, Type: hop.DataTypeMessage}}, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 	ctx := context.Background()
 
 	bk := &bookkeeping{el: el, store: store, sessionID: "sess-1", ownerAgent: "a"}
@@ -787,6 +913,14 @@ func TestEstablishRelayState_ResumesTerminalReplyLoggedButNotCompleted(t *testin
 
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
 	bootstrap.StepID = "step-1"
+	// recordTaskStatus (called from establishRelayState below, resuming the
+	// still-PENDING turn) checks checkpointd_sessions for a TERMINATING
+	// state on every hop, so a real row must exist here -- exactly as one
+	// always would in production, created by newServerSession before any
+	// relay loop starts.
+	if err := store.CreateSession(ctx, bk.sessionID, "a", "", "", bootstrap); err != nil {
+		t.Fatal(err)
+	}
 	bIn, err := json.Marshal(bootstrap)
 	if err != nil {
 		t.Fatal(err)

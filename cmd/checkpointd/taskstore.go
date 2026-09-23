@@ -58,20 +58,31 @@ func newSQLTaskStore(db *sql.DB, dialect string, el eventlog.EventLog) (*sqlTask
 	// claim, never checkpointd-minted for uniqueness, so two different agents (or two
 	// different sessions with the same agent) can genuinely claim the same
 	// TaskID string without colliding.
-	if _, err := db.Exec(fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS checkpointd_tasks (
-			task_id TEXT NOT NULL,
-			context_id TEXT NOT NULL,
-			owner_agent TEXT NOT NULL,
-			session_id TEXT NOT NULL,
-			status TEXT NOT NULL,
-			last_updated %s NOT NULL,
-			version %s NOT NULL,
-			PRIMARY KEY (task_id, owner_agent, session_id)
-		)`, intType, intType)); err != nil {
-		return nil, fmt.Errorf("taskstore: create checkpointd_tasks table: %w", err)
+	createTables := func(exec sqlExecer) error {
+		if _, err := exec.Exec(fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS checkpointd_tasks (
+				task_id TEXT NOT NULL,
+				context_id TEXT NOT NULL,
+				owner_agent TEXT NOT NULL,
+				session_id TEXT NOT NULL,
+				status TEXT NOT NULL,
+				last_updated %s NOT NULL,
+				version %s NOT NULL,
+				PRIMARY KEY (task_id, owner_agent, session_id)
+			)`, intType, intType)); err != nil {
+			return fmt.Errorf("taskstore: create checkpointd_tasks table: %w", err)
+		}
+		return createSessionsTable(exec, dialect)
 	}
-	if err := createSessionsTable(db, dialect); err != nil {
+	// Postgres needs the two CREATE TABLEs serialized across replicas (see
+	// withPostgresSchemaLock); sqlite's single on-disk file is already
+	// serialized by the filesystem, and multiple processes concurrently
+	// opening the same sqlite file isn't a supported deployment shape here.
+	if dialect == "postgres" {
+		if err := withPostgresSchemaLock(db, createTables); err != nil {
+			return nil, err
+		}
+	} else if err := createTables(db); err != nil {
 		return nil, err
 	}
 	return &sqlTaskStore{db: db, el: el, dialect: dialect}, nil

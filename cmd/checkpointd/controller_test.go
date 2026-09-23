@@ -74,7 +74,6 @@ func (noOutputHarness) Start(ctx context.Context, conversationID string, config 
 // confusing "not an A2A message" error further downstream.
 func TestRawExec_NoOutputErrors(t *testing.T) {
 	c, _, _ := newTestServerController(t, map[string]harness.Harness{"a": noOutputHarness{}})
-	defer c.Close()
 	ctx := context.Background()
 
 	_, err := rawExec(ctx, c, &proto.CreateInteractionEvent{

@@ -16,13 +16,13 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: checkpointd-server
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: checkpointd-server
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
 rules:
   - apiGroups: ["ate.dev"]
     resources: ["actortemplates"]
@@ -35,11 +35,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: checkpointd-server
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
 subjects:
   - kind: ServiceAccount
     name: checkpointd-server
-    namespace: checkpointd-llm-chat-demo
+    namespace: ${NS}
 roleRef:
   kind: Role
   name: checkpointd-server
@@ -49,12 +49,12 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: checkpointd-server
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
   labels:
     app: checkpointd-server
 spec:
   serviceName: checkpointd-server
-  replicas: 2
+  replicas: ${CHECKPOINTD_REPLICAS}
   selector:
     matchLabels:
       app: checkpointd-server
@@ -64,22 +64,21 @@ spec:
         app: checkpointd-server
     spec:
       serviceAccountName: checkpointd-server
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: ${CHECKPOINTD_TERMINATION_GRACE_SECONDS}
       containers:
         - name: checkpointd-server
           image: "${CHECKPOINTD_IMAGE}"
           command:
             - /checkpointd-app/checkpointd
             - --config=/etc/checkpointd/checkpointd.yaml
-            # Periodically lists ActorTemplates and serves any with
-            # CHECKPOINTD_AGENT=true at /agents/{id}/.
             - --discover
             - --addr=:80
-            - --base-url=http://checkpointd-server.checkpointd-llm-chat-demo.svc:80
+            - --base-url=http://checkpointd-server.${NS}.svc:80
             - --substrate-ca-file=/var/run/secrets/ate-system/ca.crt
             - --pod-name=$(POD_NAME)
             - --pod-uid=$(POD_UID)
-            - --salvage-sweep-interval=30s
+            - --salvage-sweep-interval=${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL}
+            - --log-level=debug
           env:
             - name: CHECKPOINTD_KUBERNETES_NAMESPACE
               valueFrom:
@@ -138,13 +137,11 @@ spec:
                       podcert.ate.dev/canarying: live
                   path: ca.crt
 ---
-# Not headless: kubectl port-forward svc/checkpointd-server (see demo.sh)
-# is how the demo reaches this from the host, outside the cluster.
 apiVersion: v1
 kind: Service
 metadata:
   name: checkpointd-server
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
 spec:
   selector:
     app: checkpointd-server

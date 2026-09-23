@@ -12,16 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# checkpointd config for llm-chat-demo, holding only version and eventlog since agent registration comes from --discover.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: checkpointd-config
-  namespace: checkpointd-llm-chat-demo
+  namespace: ${NS}
 data:
   checkpointd.yaml: |
     version: v1alpha
 
     eventlog:
       postgres:
-        dsn: "postgres://checkpointd:checkpointd-demo-only@postgres.checkpointd-llm-chat-demo.svc:5432/checkpointd?sslmode=disable"
+        dsn: "postgres://checkpointd:checkpointd-test-only@postgres.${NS}.svc:5432/checkpointd?sslmode=disable"

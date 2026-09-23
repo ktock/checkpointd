@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"iter"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -48,6 +49,18 @@ type serverRequestHandler struct {
 	el       eventlog.EventLog
 	store    *sqlTaskStore
 	registry *taskRegistry
+	podName  string
+	podUID   string
+	// draining, when set and true, means this instance is scaling in: no
+	// brand-new sessions, and no new work for a session it doesn't already
+	// have actively running locally. nil (e.g. in tests that construct this
+	// struct directly) behaves as "never draining".
+	draining *atomic.Bool
+}
+
+// isDraining reports whether this instance is currently scaling in.
+func (h *serverRequestHandler) isDraining() bool {
+	return h.draining != nil && h.draining.Load()
 }
 
 var _ a2asrv.RequestHandler = (*serverRequestHandler)(nil)
@@ -98,15 +111,15 @@ func loadServerSession(ctx context.Context, store *sqlTaskStore, el eventlog.Eve
 	return bk, sess.bootstrap, true, nil
 }
 
-// newServerSession durably creates a brand-new relay loop's session, along
-// with its bootstrap message.
-func newServerSession(ctx context.Context, store *sqlTaskStore, el eventlog.EventLog, agent string, bootstrap *hop.Envelope) (*bookkeeping, error) {
+// newServerSession durably creates a brand-new relay loop's session, owned
+// from inception by (podName, podUID) along with its bootstrap message.
+func newServerSession(ctx context.Context, store *sqlTaskStore, el eventlog.EventLog, agent, podName, podUID string, bootstrap *hop.Envelope) (*bookkeeping, error) {
 	const maxSessionIDAttempts = 5
 	var sessionID string
 	var err error
 	for attempt := 0; attempt < maxSessionIDAttempts; attempt++ {
 		sessionID = shortServerSessionID()
-		err = store.CreateSession(ctx, sessionID, agent, bootstrap)
+		err = store.CreateSession(ctx, sessionID, agent, podName, podUID, bootstrap)
 		if err == nil {
 			break
 		}
@@ -126,9 +139,12 @@ func newServerSession(ctx context.Context, store *sqlTaskStore, el eventlog.Even
 // startTask starts a brand-new session for msg, durably recording it before
 // returning, then hands it to awaitOrSubmit.
 func (h *serverRequestHandler) startTask(ctx context.Context, msg *a2a.Message, returnImmediately bool) (a2a.SendMessageResult, error) {
+	if h.isDraining() {
+		return nil, fmt.Errorf("checkpointd instance %s is draining for scale-in, not accepting new sessions: %w", h.podName, a2a.ErrInvalidRequest)
+	}
 	bootstrap := &hop.Envelope{From: checkpointdIdentity, To: h.agent, StepID: uuid.NewString(), Data: hop.Data{Message: msg, Type: hop.DataTypeMessage}}
 
-	bk, err := newServerSession(ctx, h.store, h.el, h.agent, bootstrap)
+	bk, err := newServerSession(ctx, h.store, h.el, h.agent, h.podName, h.podUID, bootstrap)
 	if err != nil {
 		return nil, fmt.Errorf("creating session: %w", err)
 	}
@@ -175,6 +191,12 @@ func (h *serverRequestHandler) continueTask(ctx context.Context, msg *a2a.Messag
 	msg.ContextID = task.ContextID
 
 	sessionID := stored.SessionID
+	if h.isDraining() && !h.registry.isActive(sessionID) {
+		// Still service work this instance already has actively running
+		// locally (matches "keeps processing existing relays" during
+		// scale-in); refuse anything that would newly claim ownership.
+		return nil, fmt.Errorf("checkpointd instance %s is draining for scale-in, not accepting new work for session %s: %w", h.podName, sessionID, a2a.ErrInvalidRequest)
+	}
 	bk, _, ok, err := loadServerSession(ctx, h.store, h.el, sessionID)
 	if err != nil {
 		return nil, err
@@ -183,8 +205,24 @@ func (h *serverRequestHandler) continueTask(ctx context.Context, msg *a2a.Messag
 		return nil, fmt.Errorf("task %s: its own session %s not found (data inconsistency)", msg.TaskID, sessionID)
 	}
 
+	// Durably claim cross-instance ownership before the local, per-process
+	// registry.acquire below: a session with owner_pod already set
+	// (actively driven, here or on another replica) must be refused, not
+	// silently double-driven.
+	claimed, err := h.store.ClaimSession(ctx, sessionID, h.podName, h.podUID)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, fmt.Errorf("task %s is already being processed: %w", msg.TaskID, a2a.ErrInvalidRequest)
+	}
+
 	taskCtx, release, ok := h.registry.acquire(context.Background(), sessionID)
 	if !ok {
+		// Can't happen after a successful DB claim (this process just
+		// established sole ownership), but if it somehow did, don't leak
+		// the claim.
+		mustReleaseSession(context.Background(), h.store, sessionID)
 		return nil, fmt.Errorf("task %s is already being processed: %w", msg.TaskID, a2a.ErrInvalidRequest)
 	}
 	result, err := h.awaitOrSubmit(ctx, sessionID, returnImmediately, release, func(onQualifying func(*hop.Envelope)) (*hop.Envelope, error) {
@@ -208,6 +246,7 @@ func (h *serverRequestHandler) awaitOrSubmit(reqCtx context.Context, sessionID s
 	qualifying := make(chan *hop.Envelope, 1)
 	go func() {
 		defer release()
+		defer mustReleaseSession(context.Background(), h.store, sessionID)
 		defer close(done)
 		r, err := relay(func(q *hop.Envelope) { qualifying <- q })
 		if err != nil {
@@ -323,17 +362,27 @@ func (h *serverRequestHandler) CancelTask(ctx context.Context, req *a2a.CancelTa
 		log.Infof("session %s: recording cancellation marker: %v", bk.sessionID, err)
 	}
 
-	go func() {
-		// this goroutine outlives the RPC so context.Background().
-		taskCtx, release, ok := h.registry.acquireWait(context.Background(), sessionID)
-		if !ok {
-			// Only happens if context.Background() itself ended, which it
-			// never does.
-			return
-		}
-		defer release()
-		finishTermination(taskCtx, h.c, bk)
-	}()
+	// If some other instance is still actively driving it, this claim fails
+	// and finishTermination is deliberately not run here -- CancelTaskAndSession
+	// above already durably recorded the cancellation, so the client-visible result
+	// is already correct; that instance's own driveRelayLoop will run finishTermination
+	// itself the next time it reaches a stopping point.
+	if claimed, err := h.store.ClaimSession(context.Background(), sessionID, h.podName, h.podUID); err != nil {
+		log.Infof("session %s: claiming for post-cancel cleanup: %v", sessionID, err)
+	} else if claimed {
+		go func() {
+			// this goroutine outlives the RPC so context.Background().
+			taskCtx, release, ok := h.registry.acquireWait(context.Background(), sessionID)
+			if !ok {
+				// Only happens if context.Background() itself ended, which it
+				// never does.
+				return
+			}
+			defer release()
+			defer mustReleaseSession(context.Background(), h.store, sessionID)
+			finishTermination(taskCtx, h.c, bk)
+		}()
+	}
 
 	stored, err = h.store.Get(ctx, req.ID, h.agent, req.Tenant)
 	if err != nil {

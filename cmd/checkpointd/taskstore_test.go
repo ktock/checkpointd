@@ -192,7 +192,7 @@ func TestSQLTaskStore_CancelTaskAndSession(t *testing.T) {
 	ctx := context.Background()
 
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "agent-a", "seed")
-	if err := ts.CreateSession(ctx, "session-1", "agent-a", bootstrap); err != nil {
+	if err := ts.CreateSession(ctx, "session-1", "agent-a", "pod-1", "uid-1", bootstrap); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 	task := &a2a.Task{

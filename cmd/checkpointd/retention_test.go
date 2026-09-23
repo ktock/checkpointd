@@ -86,13 +86,12 @@ func TestSweepExpiredSessions_DeletesOnlyExpiredTerminatedSessions(t *testing.T)
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 	db, _, ok := eventlog.SQLDB(el)
 	if !ok {
 		t.Fatal("eventlog.SQLDB: not a SQL-backed EventLog")
 	}
 
-	registry := newTaskRegistry()
+	registry := newTestRegistry(t)
 	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
 
 	send := func(text string) (a2a.TaskID, string) {
@@ -182,13 +181,12 @@ func TestSweepExpiredSessions_SkipsActiveSession(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 	db, _, ok := eventlog.SQLDB(el)
 	if !ok {
 		t.Fatal("eventlog.SQLDB: not a SQL-backed EventLog")
 	}
 
-	registry := newTaskRegistry()
+	registry := newTestRegistry(t)
 	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
 
 	res, err := h.SendMessage(context.Background(), &a2a.SendMessageRequest{

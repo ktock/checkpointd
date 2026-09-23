@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"iter"
+	"sync"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
@@ -29,6 +30,20 @@ import (
 var (
 	harnessAddr = flag.String("harness-addr", "127.0.0.1:50060", "address of this agent's HarnessService, i.e. this actor's own worker port")
 )
+
+var (
+	receivedMu       sync.Mutex
+	receivedMessages []string
+)
+
+func recordReceived(text string) []string {
+	receivedMu.Lock()
+	defer receivedMu.Unlock()
+	receivedMessages = append(receivedMessages, text)
+	out := make([]string, len(receivedMessages))
+	copy(out, receivedMessages)
+	return out
+}
 
 func main() {
 	flag.Parse()
@@ -76,6 +91,7 @@ func agentB(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.
 		received := text(execCtx.Message)
 		if received == firstAnswer {
 			// Turn 3 answers the first prompt, appends a second artifact chunk and metadata key, and asks a second question.
+			recordReceived(received)
 			printReceived(received)
 			if !yield(a2a.NewArtifactUpdateEvent(execCtx, notesArtifactID, a2a.NewTextPart("turn3-")), nil) {
 				return
@@ -88,10 +104,12 @@ func agentB(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.
 		}
 
 		// Turn 4 answers the second prompt and completes, touching neither the artifact nor Metadata.
+		history := recordReceived(received)
 		printReceived(received)
 		yield(a2a.NewStatusUpdateEvent(execCtx, a2a.TaskStateCompleted,
 			a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewDataPart(map[string]any{
-				"data": fmt.Sprintf("B received: %s", received),
+				"data":             fmt.Sprintf("B received: %s", received),
+				"received_history": history,
 			}))), nil)
 	}
 }

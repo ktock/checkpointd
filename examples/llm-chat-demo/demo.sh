@@ -14,7 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Drives chat-agent from outside the cluster: greet, ask a follow-up, restart every kind worker node (checkpointd-server included), ask again, and confirm the conversation log survived.
+# Drives chat-agent from outside the cluster to show checkpointd's two
+# separate resilience properties in turn:
+#   1. any instance can correctly handle a request for an existing session --
+#      turn 1 goes to checkpointd-server-0, turn 2 is sent directly to
+#      checkpointd-server-1 instead and still continues the same session.
+#   2. the conversation survives an unclean crash of both instances at once --
+#      both replicas' own checkpointd process is SIGKILLed (not the pod, not
+#      the node); restartPolicy: Never means neither restarts in place, so
+#      Kubernetes replaces both with fresh pods instead, and turn 3, sent via
+#      the round-robin Service once the replacements are Ready, proves the
+#      session still resumes correctly -- its state lives in the shared
+#      Postgres-backed event log and the agent's own actor checkpoint, not
+#      in whichever specific checkpointd-server process last touched it.
 #
 # Usage: examples/llm-chat-demo/demo.sh
 #
@@ -43,6 +55,11 @@ command -v curl >/dev/null 2>&1 || fail "curl not found on PATH"
 run_kubectl get namespace "$NS" >/dev/null 2>&1 \
   || fail "namespace $NS not found in context $KUBECTL_CONTEXT -- run setup.sh first"
 
+POD_0="checkpointd-server-0"
+POD_1="checkpointd-server-1"
+run_kubectl -n "$NS" get pod "$POD_1" >/dev/null 2>&1 \
+  || fail "$POD_1 not found -- run setup.sh first (needs at least 2 checkpointd-server replicas)"
+
 # --- Install the a2a CLI, pinned to this repo's own a2a-go version -----
 A2A_CLI_VERSION="v2.5.0"
 A2A_CLI_BIN_DIR="$(mktemp -d -t checkpointd-llm-chat-demo-a2a-cli.XXXXXXXX)"
@@ -61,8 +78,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# start_port_forward retries the whole `kubectl port-forward` process, up to 3 times, so a mid-restart target gets re-resolved.
+# start_port_forward retries the whole `kubectl port-forward` process, up to
+# 3 times, so a mid-restart target gets re-resolved. With no argument, it
+# reuses whatever target was last set (default: the round-robin Service) --
+# this is what lets send()'s and pollForReplyChange()'s own internal retries
+# (which call this bare) preserve a caller's explicit target (e.g.
+# "pod/$POD_1") across a retry instead of silently falling back to the
+# Service.
+CURRENT_PF_TARGET="svc/checkpointd-server"
 start_port_forward() {
+  [[ $# -gt 0 ]] && CURRENT_PF_TARGET="$1"
+  local target="$CURRENT_PF_TARGET"
   local attempt pf_log
   pf_log="$(mktemp)"
   for attempt in 1 2 3; do
@@ -70,9 +96,9 @@ start_port_forward() {
       kill "$PORT_FORWARD_PID" 2>/dev/null || true
       wait "$PORT_FORWARD_PID" 2>/dev/null || true
     fi
-    log "port-forwarding svc/checkpointd-server (attempt $attempt/3)"
+    log "port-forwarding $target (attempt $attempt/3)"
     : >"$pf_log"
-    run_kubectl -n "$NS" port-forward svc/checkpointd-server "${LOCAL_PORT:-}:80" \
+    run_kubectl -n "$NS" port-forward "$target" "${LOCAL_PORT:-}:80" \
       >"$pf_log" 2>&1 &
     PORT_FORWARD_PID=$!
     local i
@@ -90,7 +116,7 @@ start_port_forward() {
     log "  never became reachable within 10s"
   done
   rm -f "$pf_log"
-  fail "port-forward to svc/checkpointd-server never became reachable after 3 attempts"
+  fail "port-forward to $target never became reachable after 3 attempts"
 }
 
 AGENT_URL=""
@@ -164,126 +190,93 @@ pollForReplyChange() {
   return 1
 }
 
-start_port_forward
+log "=== send: Hi, I'm Foo. (targeted directly at $POD_0) ==="
+start_port_forward "pod/$POD_0"
 waitForAgentReady
-
-log "=== send: Hi, I'm Foo. ==="
 send "Hi, I'm Foo."
 echo "  reply:"
 echo "$REPLY" | sed 's/^/    /'
 
-log "=== send: What is your name? ==="
+# Proves property 1: any instance can pick up an existing session, not just
+# the one that started it. $POD_1 has never seen this session before now.
+log "=== send: What is your name? (targeted directly at $POD_1, a different instance from turn 1) ==="
+start_port_forward "pod/$POD_1"
+waitForAgentReady
 send "What is your name?"
 echo "  reply:"
 echo "$REPLY" | sed 's/^/    /'
 
-# Restarts every worker node rather than the control-plane node.
-log "=== restarting every kind *worker* node (simulating a real node crash+reboot, not just a pod delete) ==="
-mapfile -t worker_nodes < <(docker ps --format '{{.Names}}' --filter "name=${KIND_CLUSTER_NAME}-worker")
-[[ "${#worker_nodes[@]}" -gt 0 ]] || fail "no kind worker node containers found for cluster '$KIND_CLUSTER_NAME' -- was it created with KIND_WORKER_NODES=0?"
+log "=== crashing checkpointd's own process on both $POD_0 and $POD_1 (even though restartPolicy: Never means neither pod restarts in place, the conversation still recovers correctly) ==="
 
-# Snapshots taken before the restart, so we can later confirm the restart
-# actually happened, instead of only checking that kubectl reports
-# everything Ready again afterward -- which would stay true even if a node
-# or pod was silently left untouched.
-log "  snapshotting node container start times, checkpointd-server-0's pod uid, and the harness WorkerPool's own worker pod uids, before restarting anything"
-declare -A node_started_before
-for n in "${worker_nodes[@]}"; do
-  node_started_before["$n"]="$(docker inspect -f '{{.State.StartedAt}}' "$n")"
-  [[ -n "${node_started_before[$n]}" ]] || fail "could not read container start time for kind node $n before restarting it"
-done
-checkpointd_uid_before="$(run_kubectl -n "$NS" get pod checkpointd-server-0 -o jsonpath='{.metadata.uid}')"
-[[ -n "$checkpointd_uid_before" ]] || fail "could not read checkpointd-server-0's pod uid before the node restart"
-harness_uids_before="$(run_kubectl -n "$NS" get pods -o json 2>/dev/null \
-  | jq -r --arg prefix "${NS}-harness-" '[.items[] | select(.metadata.name | startswith($prefix)) | .metadata.uid] | sort | join(",")')"
-[[ -n "$harness_uids_before" ]] || fail "found no harness WorkerPool worker pods (name prefix ${NS}-harness-) in $NS before the node restart"
+crashCheckpointd() {
+  local pod=$1 node helper
+  node="$(run_kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
+  [[ -n "$node" ]] || fail "could not read $pod's own node name"
+  helper="crash-helper-$pod"
+  log "  crashing $pod's own checkpointd process (SIGKILL) via a short-lived hostPID helper pod on $node"
+  run_kubectl -n "$NS" delete pod "$helper" --ignore-not-found --wait=true >/dev/null 2>&1
+  run_kubectl -n "$NS" run "$helper" --restart=Never --image=busybox:1.36 \
+    --overrides="{\"spec\":{\"hostPID\":true,\"nodeName\":\"$node\"}}" \
+    --command -- sh -c '
+      self=$$
+      for f in /proc/[0-9]*/cmdline; do
+        pid=${f#/proc/}; pid=${pid%/cmdline}
+        [ "$pid" = "$self" ] && continue
+        cmd=$(tr "\0" " " < "$f" 2>/dev/null)
+        case "$cmd" in
+          */checkpointd-app/checkpointd\ *--pod-name='"$pod"'\ *)
+            kill -9 "$pid"
+            exit 0
+            ;;
+        esac
+      done
+      echo "no checkpointd process found for pod '"$pod"'" >&2
+      exit 1
+    ' >/dev/null \
+    || fail "could not create the crash helper pod for $pod"
+  run_kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$helper" --timeout=60s \
+    || fail "crash helper pod for $pod never completed -- could not confirm SIGKILL was delivered to $pod's own checkpointd process"
+  run_kubectl -n "$NS" delete pod "$helper" --wait=false >/dev/null 2>&1 || true
+}
 
-log "  restarting: ${worker_nodes[*]}"
-docker restart "${worker_nodes[@]}" >/dev/null
+# Captured before the crash: restartPolicy: Never means the StatefulSet
+# controller replaces each pod (new uid) rather than kubelet restarting the
+# same one in place, but that replacement -- like any Failed pod's cleanup
+# under a StatefulSet -- can happen faster than polling status.phase can
+# reliably observe (confirmed live: the transient Failed phase is often too
+# narrow a window to catch). A uid change is a permanent, reliably-pollable
+# fact instead, so that's what's checked below, not the phase.
+uid_before_0="$(run_kubectl -n "$NS" get pod "$POD_0" -o jsonpath='{.metadata.uid}')"
+uid_before_1="$(run_kubectl -n "$NS" get pod "$POD_1" -o jsonpath='{.metadata.uid}')"
 
-log "  confirming every restarted node container actually stopped and started again, not a silent no-op"
-for n in "${worker_nodes[@]}"; do
-  node_started_after="$(docker inspect -f '{{.State.StartedAt}}' "$n")"
-  [[ -n "$node_started_after" && "$node_started_after" != "${node_started_before[$n]}" ]] \
-    || fail "kind node $n's container start time did not change after 'docker restart' (before: ${node_started_before[$n]}, after: ${node_started_after:-<none>}) -- it was never actually restarted"
-done
-log "  every restarted node container's start time changed -- confirmed real restarts"
+crashCheckpointd "$POD_0"
+crashCheckpointd "$POD_1"
 
-log "  waiting for every node to report Ready again (up to 3 minutes)"
-run_kubectl wait --for=condition=Ready nodes --all --timeout=180s \
-  || fail "not every node became Ready again after the restart"
+log "  waiting for checkpointd-server's own StatefulSet to bring both crashed replicas back (restartPolicy: Never forbids an in-place restart)"
+run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=180s \
+  || fail "checkpointd-server's own StatefulSet never finished bringing both crashed replicas back"
 
-log "  recreating pods that were already running on any restarted worker node"
-# Force-deleting every pod that was on one of these nodes breaks the "Pod sandbox changed" cycle instead of waiting it out.
-stale_pods="" stale_ate_pods=""
-for n in "${worker_nodes[@]}"; do
-  stale_pods+=" $(run_kubectl -n "$NS" get pods --field-selector "spec.nodeName=$n" -o jsonpath='{.items[*].metadata.name}')"
-  # ate-system also lands on these same nodes by default, so it needs the same recovery to avoid adding latency or resetting egress calls.
-  stale_ate_pods+=" $(run_kubectl -n ate-system get pods --field-selector "spec.nodeName=$n" -o jsonpath='{.items[*].metadata.name}')"
-done
-stale_pods="$(echo $stale_pods)"
-stale_ate_pods="$(echo $stale_ate_pods)"
-if [[ -n "$stale_pods" ]]; then
-  log "    deleting ($NS): $stale_pods"
-  # shellcheck disable=SC2086
-  run_kubectl -n "$NS" delete pod $stale_pods --grace-period=0 --force --wait=false
-fi
-if [[ -n "$stale_ate_pods" ]]; then
-  log "    deleting (ate-system): $stale_ate_pods"
-  # shellcheck disable=SC2086
-  run_kubectl -n ate-system delete pod $stale_ate_pods --grace-period=0 --force --wait=false
-  log "  waiting for ate-system's control plane to be ready again (up to 2 minutes each)"
-  for d in ate-api-server atenet-egress atenet-router; do
-    run_kubectl -n ate-system rollout status "deployment/$d" --timeout=120s \
-      || fail "ate-system's $d never became Ready again after the node restart"
+for pod in "$POD_0" "$POD_1"; do
+  before_var="uid_before_${pod##*-}"
+  uid_after=""
+  for i in $(seq 1 30); do
+    uid_after="$(run_kubectl -n "$NS" get pod "$pod" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    [[ -z "$uid_after" || "$uid_after" != "${!before_var}" ]] && break
+    sleep 2
   done
-  run_kubectl -n ate-system rollout status daemonset/atelet --timeout=120s \
-    || fail "ate-system's atelet never became Ready again after the node restart"
-fi
-
-log "  waiting for the WorkerPool to report Ready again (up to 3 minutes)"
-workerpool_ready=0
-for _ in $(seq 1 90); do
-  ready="$(run_kubectl -n "$NS" get workerpool checkpointd-llm-chat-demo-harness -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-  want="$(run_kubectl -n "$NS" get workerpool checkpointd-llm-chat-demo-harness -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
-  if [[ -n "$ready" && -n "$want" && "$ready" == "$want" ]]; then
-    workerpool_ready=1
-    break
-  fi
-  sleep 2
+  [[ -z "$uid_after" || "$uid_after" != "${!before_var}" ]] \
+    || fail "$pod still has its pre-crash uid (${!before_var}) -- expected restartPolicy: Never to prevent an in-place restart"
+  log "  $pod confirmed NOT restarted in place (uid ${!before_var} -> ${uid_after:-gone}) -- Kubernetes replaced it with a fresh pod instead of reusing it"
 done
-[[ "$workerpool_ready" == "1" ]] || fail "WorkerPool never became fully Ready again after recreating the restarted nodes' own pods"
 
-log "  waiting for llama-completion to be reachable again (up to 2 minutes)"
-run_kubectl -n "$NS" rollout status deployment/llama-completion --timeout=120s \
-  || fail "llama-completion never became Ready again after the node restart"
-
-log "  waiting for checkpointd-server to be reachable again (up to 2 minutes)"
-run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=120s \
-  || fail "checkpointd-server never became Ready again after the node restart"
-
-log "  confirming checkpointd-server-0 and every harness worker pod were actually recreated, not left running untouched"
-checkpointd_uid_after="$(run_kubectl -n "$NS" get pod checkpointd-server-0 -o jsonpath='{.metadata.uid}')"
-[[ -n "$checkpointd_uid_after" ]] || fail "could not read checkpointd-server-0's pod uid after the node restart"
-[[ "$checkpointd_uid_after" != "$checkpointd_uid_before" ]] \
-  || fail "checkpointd-server-0 still has the same pod uid ($checkpointd_uid_before) after the node restart -- it was never actually force-deleted/recreated"
-harness_uids_after="$(run_kubectl -n "$NS" get pods -o json 2>/dev/null \
-  | jq -r --arg prefix "${NS}-harness-" '[.items[] | select(.metadata.name | startswith($prefix)) | .metadata.uid] | sort | join(",")')"
-[[ -n "$harness_uids_after" ]] || fail "found no harness WorkerPool worker pods (name prefix ${NS}-harness-) in $NS after the node restart"
-common_uids="$(comm -12 <(tr ',' '\n' <<<"$harness_uids_before" | sort) <(tr ',' '\n' <<<"$harness_uids_after" | sort))"
-[[ -z "$common_uids" ]] \
-  || fail "some harness WorkerPool worker pod(s) survived the node restart unchanged (uid(s): $(tr '\n' ' ' <<<"$common_uids")) -- expected every worker pod to have been recreated along with its node"
-log "  checkpointd-server-0 (uid $checkpointd_uid_before -> $checkpointd_uid_after) and all ${#worker_nodes[@]} restarted node(s)' harness worker pods were genuinely recreated -- confirmed real restarts throughout, not assumed ones"
-
-# Picked to not depend on SmolLM2's actual reasoning, since the check below only needs the log to have survived.
-log "=== send: What is the weather? (same task -- reply's own log should still carry both messages above) ==="
-start_port_forward
+log "=== send: What is the weather? (via svc/checkpointd-server, now that both replacement instances are Ready) ==="
+start_port_forward "svc/checkpointd-server"
 waitForAgentReady
 send "What is the weather?"
 echo "  reply:"
 echo "$REPLY" | sed 's/^/    /'
 
-[[ "$REPLY" == *"Hi, I'm Foo."* ]] || fail "post-crash reply's own conversation log is missing the pre-crash message 'Hi, I'm Foo.' -- the running history did not survive the node restart"
-[[ "$REPLY" == *"What is your name?"* ]] || fail "post-crash reply's own conversation log is missing the pre-crash message 'What is your name?' -- the running history did not survive the node restart"
+[[ "$REPLY" == *"Hi, I'm Foo."* ]] || fail "post-crash reply's own conversation log is missing the pre-crash message 'Hi, I'm Foo.' -- the running history did not survive both instances' checkpointd process crashing"
+[[ "$REPLY" == *"What is your name?"* ]] || fail "post-crash reply's own conversation log is missing the pre-crash message 'What is your name?' -- the running history did not survive both instances' checkpointd process crashing"
 
-log "PASS -- chat-agent's full conversation log survived every kind worker node restarting, checkpointd-server included."
+log "PASS -- turn 1 ($POD_0) and turn 2 ($POD_1) prove any instance can handle a request for an existing session; turn 3 proves the conversation still recovers fully correct after both original instances' own checkpointd process was killed with SIGKILL and Kubernetes replaced them with fresh pods instead of restarting them in place."

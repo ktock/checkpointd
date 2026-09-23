@@ -66,54 +66,44 @@ Start a kind cluster with Agent Substrate, checkpointd, and both demo agents dep
 
 Drive the whole scenario.
 
-- send a couple of messages to `chat-agent`
-- restart of one kind worker node
-- one more message: the reply's own conversation log still carries every message from before the crash
+- Send a message to `chat-agent`, then a follow-up message sent to a different checkpointd replica. It still continues the same session.
+- Kill both checkpointd replicas with SIGKILL.
+- Send one more message once the replacement replicas are ready. The reply's own conversation log still carries every message from before the crash.
 
 ```sh
 ./examples/llm-chat-demo/demo.sh
 ```
 
 <details>
-<summary>The last message will be like the following. The conversation log is still preserved in memory after node restart.</summary>
+<summary>The last message will be like the following. The conversation log is still preserved even though both original checkpointd replicas were killed and replaced.</summary>
 
 ```
-[llm-chat-demo]   running: /tmp/checkpointd-llm-chat-demo-a2a-cli.H17igG54/a2a --transport jsonrpc --timeout 120s send http://127.0.0.1:44463/agents/chat-agent/ -o json --task 01a0a553-43fc-7dcf-826b-b30c26144775 --tenant b92569bbabce4377 What is the weather?
+[llm-chat-demo]   running: /tmp/checkpointd-llm-chat-demo-a2a-cli.gjePw9IZ/a2a --transport jsonrpc --timeout 120s send http://127.0.0.1:44493/agents/chat-agent/ -o json --task 01a0d165-348e-73e1-aba8-6e56ab9fcd0c --tenant af75b8f994f34792 What is the weather?
   reply:
     Assistant: The weather is sunny.
-    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    Reviewer: That's a good start, Foo. You're giving a thoughtful opinion on the assistant's answer. I appreciate your effort in doing so.
     
-    "The weather is sunny."
-    
-    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "The weather is" as it's not necessary to convey
+    A one-word answer, Foo, is a good choice. It's concise and conveys the main point of the conversation. A second-
     
     --- conversation log from process memory ---
     User: Hi, I'm Foo.
-    Assistant: Hi, I'm Foo.
-    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    Assistant: Hello, I'm Foo.
+    Reviewer: That's a great start, Foo. You're taking the time to give a thoughtful opinion on the assistant's answer. I appreciate your effort in doing so.
     
-    "Hi, I'm Foo.
-    
-    I'm glad you asked about me."
-    
-    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase
+    A one-word answer, Foo, is a good choice. It's concise and conveys the main point of the conversation. A second-
     ------------------------
     User: What is your name?
     Assistant: My name is Foo.
-    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    Reviewer: That's a good start, Foo. You're giving a thoughtful opinion on the assistant's answer. I appreciate your effort in doing so.
     
-    "My name is Foo."
-    
-    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "My name is" as it's not necessary to
+    A one-word answer, Foo, is a good choice. It's concise and conveys the main point of the conversation. A second-
     ------------------------
     User: What is the weather?
     Assistant: The weather is sunny.
-    Reviewer: Your answer is a good start, but it could be more concise and polished. Here's a revised version:
+    Reviewer: That's a good start, Foo. You're giving a thoughtful opinion on the assistant's answer. I appreciate your effort in doing so.
     
-    "The weather is sunny."
-    
-    This response conveys a similar sentiment, but in a more concise and polished way. I removed the phrase "The weather is" as it's not necessary to convey
-[llm-chat-demo] PASS -- chat-agent's full conversation log survived every kind worker node restarting, checkpointd-server included.
+    A one-word answer, Foo, is a good choice. It's concise and conveys the main point of the conversation. A second-
+[llm-chat-demo] PASS -- turn 1 (checkpointd-server-0) and turn 2 (checkpointd-server-1) prove any instance can handle a request for an existing session; turn 3 proves the conversation still recovers fully correct after both original instances' own checkpointd process was killed with SIGKILL and Kubernetes replaced them with fresh pods instead of restarting them in place.
 ```
 </details>
 
@@ -282,11 +272,11 @@ In the callee agent, our custom transport extracts the message contents from thi
 - [`./docs/deployment.md`](./docs/deployment.md): Deployment overview using KinD
 - [`./docs/agents.md`](./docs/agents.md): How to integrate a2a-go with checkpointd
 - [`./docs/flags.md`](./docs/flags.md): Available flags
+- [`./docs/replication.md`](./docs/replication.md): Running multiple checkpointd instances
 
 ## Roadmap
 
 - Implement Antigravity and python path (currently tested only on Substrate)
-- Support replication
 - Support optional and non-MUST level A2A features
 
 ## Acknowledgement
