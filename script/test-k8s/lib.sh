@@ -49,6 +49,30 @@ dump_checkpointd_server_logs() {
   run_kubectl -n "$NS" logs pod/checkpointd-server-0 2>&1 | sed 's/^/[checkpointd-server] /' >&2 || true
 }
 
+# dumpAllCheckpointdServerLogs prints every checkpointd-server replica's own
+# logs.
+dumpAllCheckpointdServerLogs() {
+  log "--- checkpointd-server logs (all replicas) ---"
+  local pod
+  for pod in $(run_kubectl -n "$NS" get pods -l app=checkpointd-server -o name 2>/dev/null); do
+    run_kubectl -n "$NS" logs "$pod" 2>&1 | sed "s/^/[${pod#pod/}] /" >&2 || true
+  done
+}
+
+# countRelaysToAcrossPods is countRelaysTo generalized across every
+# checkpointd-server replica's own current logs.
+countRelaysToAcrossPods() {
+  local targetActorID=$1 pod total=0 n
+  for pod in $(run_kubectl -n "$NS" get pods -l app=checkpointd-server -o name 2>/dev/null); do
+    n="$(run_kubectl -n "$NS" logs "$pod" 2>/dev/null \
+      | jq -R -r --arg id "$targetActorID" \
+          'fromjson? | select(.msg == "Suspending SubstrATE actor" and .conversation_id == $id) | .conversation_id' \
+      | wc -l | tr -d ' ')"
+    total=$((total + n))
+  done
+  echo "$total"
+}
+
 # dump_testserver_diagnostics prints testserver's pod status and logs.
 dump_testserver_diagnostics() {
   log "--- testserver pod status ---"
@@ -117,6 +141,38 @@ restart_checkpointd_server_pod() {
   run_kubectl -n "$NS" wait --for=condition=Ready pod/checkpointd-server-0 --timeout=180s \
     || { dump_checkpointd_server_logs; fail "checkpointd-server-0 never became Ready again after being deleted"; }
   start_port_forward
+}
+
+# signalCheckpointd sends a signal to a checkpointd-server pod's own process
+# via a short-lived hostPID helper pod, without deleting or restarting the pod itself.
+signalCheckpointd() {
+  local pod=$1 sig=$2 node helper
+  node="$(run_kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
+  [[ -n "$node" ]] || fail "could not read $pod's own node name"
+  helper="signal-helper-$pod"
+  run_kubectl -n "$NS" delete pod "$helper" --ignore-not-found --wait=true >/dev/null 2>&1
+  run_kubectl -n "$NS" run "$helper" --restart=Never --image=busybox:1.36 \
+    --overrides="{\"spec\":{\"hostPID\":true,\"nodeName\":\"$node\"}}" \
+    --command -- sh -c '
+      self=$$
+      for f in /proc/[0-9]*/cmdline; do
+        pid=${f#/proc/}; pid=${pid%/cmdline}
+        [ "$pid" = "$self" ] && continue
+        cmd=$(tr "\0" " " < "$f" 2>/dev/null)
+        case "$cmd" in
+          */checkpointd-app/checkpointd\ *--pod-name='"$pod"'\ *)
+            kill -'"$sig"' "$pid"
+            exit 0
+            ;;
+        esac
+      done
+      echo "no checkpointd process found for pod '"$pod"'" >&2
+      exit 1
+    ' >/dev/null \
+    || fail "could not create the signal helper pod for $pod"
+  run_kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$helper" --timeout=60s \
+    || fail "signal helper pod for $pod never completed -- could not confirm $sig was delivered to $pod's own checkpointd process"
+  run_kubectl -n "$NS" delete pod "$helper" --wait=false >/dev/null 2>&1 || true
 }
 
 # a2a_cli runs the pinned a2a CLI over jsonrpc, retrying transport-level failures a few times.
@@ -258,4 +314,44 @@ checkCallNotRepeated() {
   count="$(countRelaysTo "$targetActorID")"
   [[ "$count" == "$want" ]] \
     || fail "$label: checkpointd dispatched $count turns to $targetActorID (want exactly $want) -- recovery redid an already-completed hop instead of resuming past it"
+}
+
+# checkCallNotRepeatedAcrossPods is checkCallNotRepeated generalized across
+# every checkpointd-server replica's own current logs -- unreliable for a
+# replica whose pod (and thus its logs) has since been removed.
+checkCallNotRepeatedAcrossPods() {
+  local tenant=$1 target=$2 want=$3 label=$4
+  local targetActorID
+  targetActorID="$(actorName "$tenant" "$target")"
+  local count
+  count="$(countRelaysToAcrossPods "$targetActorID")"
+  [[ "$count" == "$want" ]] \
+    || fail "$label: checkpointd dispatched $count turns to $targetActorID across all current replicas (want exactly $want) -- recovery redid an already-completed hop, or double-drove it from two instances at once, instead of resuming past it"
+}
+
+# portForwardToPod starts a short-lived port-forward directly to one pod,
+# bypassing svc/checkpointd-server's round-robin. Prints "<local_port> <pid>"
+# on success; the caller must `kill "$pid"; wait "$pid" 2>/dev/null || true`
+# when done (the `|| true` matters under set -e). Fails if the tunnel never
+# comes up.
+portForwardToPod() {
+  local pod=$1 remote_port=$2
+  local pf_log local_port pid i
+  pf_log="$(mktemp)"
+  run_kubectl -n "$NS" port-forward "pod/$pod" ":$remote_port" >"$pf_log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 50); do
+    local_port="$(sed -nE 's#^Forwarding from 127\.0\.0\.1:([0-9]+) ->.*#\1#p' "$pf_log" | tail -1)"
+    if [[ -n "$local_port" ]] && (exec 3<>"/dev/tcp/127.0.0.1/$local_port") 2>/dev/null; then
+      exec 3<&- 3>&-
+      rm -f "$pf_log"
+      echo "$local_port $pid"
+      return 0
+    fi
+    sleep 0.2
+  done
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null || true
+  rm -f "$pf_log"
+  return 1
 }

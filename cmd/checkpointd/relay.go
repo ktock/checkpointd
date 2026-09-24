@@ -116,11 +116,24 @@ type bookkeeping struct {
 	ownerAgent string
 }
 
+// errSessionTerminating is recordTaskStatus's own signal that this session
+// has been durably marked TERMINATING since this relay loop last checked.
+var errSessionTerminating = errors.New("relay: session marked terminating")
+
 // recordTaskStatus durably records a hop's own just-received reply as this
 // task's current status so GetTask/ListTasks see the result eagerly, right after
 // every execA2A call succeeds. theFirstAgent is whoever this specific call's own
 // relay chain is fundamentally addressed to.
 func (bk *bookkeeping) recordTaskStatus(ctx context.Context, res *hop.Envelope, theFirstAgent string) error {
+	sess, err := bk.store.GetSession(ctx, bk.sessionID)
+	if err != nil {
+		return fmt.Errorf("checking session state: %w", err)
+	}
+	// check whether this session has been durably marked TERMINATING since
+	// this relay loop last checked
+	if sess.state == sessionStateTerminating {
+		return errSessionTerminating
+	}
 	if res.From != theFirstAgent {
 		// some other agent's own internal claim which must never become
 		// this task's own externally-visible status.
@@ -207,8 +220,16 @@ func (bk *bookkeeping) lastHop(ctx context.Context) (*hop.Envelope, *proto.StepE
 }
 
 // visitedActorsFromHistory returns the distinct set of (private actor id ->
-// agent) pairs this relay loop has ever contacted, for cleanupActors to
-// delete once it completes.
+// agent) pairs this relay loop has ever dispatched a turn to, for
+// cleanupActors to delete once it completes.
+//
+// Identifies them via each event's own ConversationId/AgentId, which
+// Controller.Exec's LogInputs durably records at the very start of every
+// turn -- before the harness ever runs -- rather than by parsing a reply's
+// own envelope. This matters for an actor whose turn was interrupted before
+// it ever replied even once (e.g. its own relay hop aborted mid-flight by a
+// cross-instance cancellation, or a locally-driven one cancelAndWait just
+// canceled).
 func visitedActorsFromHistory(ctx context.Context, el eventlog.EventLog, sessionID string) (map[string]string, error) {
 	events, err := el.EventsBySessionID(ctx, sessionID)
 	if err != nil {
@@ -216,16 +237,10 @@ func visitedActorsFromHistory(ctx context.Context, el eventlog.EventLog, session
 	}
 	actors := make(map[string]string)
 	for _, ev := range events {
-		if isCheckpointdInputStep(ev) {
-			// this is not from a real Substrate actor (e.g. bootstrap message).
+		if ev.AgentId == "" || ev.ConversationId == "" {
 			continue
 		}
-		env, ok := hop.Parse(newestText(ev.Steps))
-		if !ok {
-			continue
-		}
-		agent := env.From
-		actors[actorConv(sessionID, agent)] = agent
+		actors[ev.ConversationId] = ev.AgentId
 	}
 	return actors, nil
 }
@@ -300,6 +315,9 @@ func stepText(steps []*proto.Step) string {
 func runRelayLoop(ctx context.Context, c *controller.Controller, el eventlog.EventLog, bk *bookkeeping, agent string, bootstrap *hop.Envelope, onQualifying func(*hop.Envelope)) (*hop.Envelope, error) {
 	res, err := establishRelayState(ctx, c, el, bk, agent, bootstrap)
 	if err != nil {
+		if errors.Is(err, errSessionTerminating) {
+			return stopForTermination(ctx, c, bk, res)
+		}
 		return nil, err
 	}
 	return driveRelayLoop(ctx, c, el, bk, agent, res, agent, onQualifying)
@@ -363,8 +381,28 @@ func establishRelayState(ctx context.Context, c *controller.Controller, el event
 		return nil, fmt.Errorf("resumed reply for actor %s is not an A2A message: %s", lastStep.ConversationId, out)
 	}
 	if err := bk.recordTaskStatus(ctx, res, agent); err != nil {
+		if errors.Is(err, errSessionTerminating) {
+			// res was already successfully parsed above, so it's returned
+			// alongside the sentinel -- runRelayLoop's own caller (this
+			// function's caller) needs a non-nil res to hand to
+			// stopForTermination.
+			return res, err
+		}
 		return nil, err
 	}
+	return res, nil
+}
+
+// stopForTermination finishes a relay loop early because recordTaskStatus
+// detected this session was durably marked TERMINATING by a cross-instance
+// CancelTask since this loop last checked. res -- whatever this loop's own
+// most recent hop reply was -- is returned as-is: the caller's own
+// authoritative answer comes from re-reading the task row afterward
+// (awaitOrSubmit does exactly this), not from this return value, so it only
+// needs to be non-nil, not necessarily final.
+func stopForTermination(ctx context.Context, c *controller.Controller, bk *bookkeeping, res *hop.Envelope) (*hop.Envelope, error) {
+	log.Infof("session %s: marked TERMINATING by a cross-instance cancellation, stopping the relay loop early", bk.sessionID)
+	finishTermination(ctx, c, bk)
 	return res, nil
 }
 
@@ -401,6 +439,9 @@ func driveRelayLoop(ctx context.Context, c *controller.Controller, el eventlog.E
 			return nil, err
 		}
 		if err := bk.recordTaskStatus(ctx, res, theFirstAgent); err != nil {
+			if errors.Is(err, errSessionTerminating) {
+				return stopForTermination(ctx, c, bk, res)
+			}
 			return nil, err
 		}
 		notify(res)

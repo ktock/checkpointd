@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
@@ -30,6 +32,17 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/ktock/checkpointd/harness"
 )
+
+// cardResolver deliberately skips agentcard.DefaultResolver's keep-alive
+// connection pooling: this actor process is long-lived (a Substrate worker
+// persists across turns), so a pooled connection can point at a
+// checkpointd-server replica whose node has since gone down, and reusing it
+// for a later turn fails instead of picking up the still-healthy Service
+// endpoint a fresh dial would reach.
+var cardResolver = agentcard.NewResolver(&http.Client{
+	Timeout:   30 * time.Second,
+	Transport: &http.Transport{DisableKeepAlives: true},
+})
 
 var (
 	harnessAddr     = flag.String("harness-addr", "127.0.0.1:50060", "address of this agent's HarnessService")
@@ -89,7 +102,7 @@ func askReviewer(ctx context.Context, execCtx *a2asrv.ExecutorContext, in, myAns
 	if *checkpointdAddr == "" {
 		return "", fmt.Errorf("--checkpointd-addr is required (used to resolve %s's AgentCard)", *reviewerAgentID)
 	}
-	card, err := agentcard.DefaultResolver.Resolve(ctx, "http://"+*checkpointdAddr+"/agents/"+*reviewerAgentID+"/.well-known/agent-card.json")
+	card, err := cardResolver.Resolve(ctx, "http://"+*checkpointdAddr+"/agents/"+*reviewerAgentID+"/.well-known/agent-card.json")
 	if err != nil {
 		return "", fmt.Errorf("resolving %s's AgentCard from %s: %w", *reviewerAgentID, *checkpointdAddr, err)
 	}

@@ -97,6 +97,14 @@ spec:
               port: 80
             initialDelaySeconds: 2
             periodSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          restartPolicy: Never
           volumeMounts:
             - name: data
               mountPath: /data

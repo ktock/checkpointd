@@ -63,7 +63,40 @@ func newTestServerController(t *testing.T, harnesses map[string]harness.Harness)
 	if err != nil {
 		t.Fatalf("controller.New: %v", err)
 	}
+	t.Cleanup(func() { c.Close() })
 	return c, el, store
+}
+
+// newTestRegistry returns a fresh taskRegistry and registers a t.Cleanup
+// that waits for it to go idle (no more actively-driving goroutines) before
+// returning -- registered after newTestServerController's own t.Cleanup(c.Close)
+// in every caller (the universal pattern: controller first, registry
+// second), so per Go's LIFO cleanup ordering this idle-wait always runs
+// *before* the DB closes. Without it, a still-running background goroutine
+// (resumeClaimedSession's, awaitOrSubmit's, ...) can reach its own deferred
+// mustReleaseSession/mustRevertClaim after the test's own DB is already closed,
+// panicking and crashing the whole test binary -- exactly the failure mode
+// those panics are meant to produce for real, just misattributed to test
+// teardown instead of an actual bug.
+func newTestRegistry(t *testing.T) *taskRegistry {
+	t.Helper()
+	r := newTaskRegistry()
+	t.Cleanup(func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			r.mu.Lock()
+			n := len(r.active)
+			r.mu.Unlock()
+			if n == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("taskRegistry still has %d active entr(y/ies) 5s after the test finished -- a background goroutine never released", n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	return r
 }
 
 // TestNewServerSession_ShortSessionID confirms bk.sessionID stays short
@@ -74,7 +107,7 @@ func TestNewServerSession_ShortSessionID(t *testing.T) {
 	msg := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
 	msg.Data.Message.ContextID = "ctx-1"
 
-	bk, err := newServerSession(ctx, store, el, "a", msg)
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", msg)
 	if err != nil {
 		t.Fatalf("newServerSession: %v", err)
 	}
@@ -108,7 +141,7 @@ func TestLoadServerSession_RecoversBootstrapBeforeFirstHop(t *testing.T) {
 	msg := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed-data")
 	msg.Data.Message.ContextID = "ctx-1"
 
-	created, err := newServerSession(ctx, store, el, "a", msg)
+	created, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", msg)
 	if err != nil {
 		t.Fatalf("newServerSession: %v", err)
 	}
@@ -148,11 +181,10 @@ func TestRunRelayLoop_RecoversHopRecordedButNeverAttempted(t *testing.T) {
 		return replyFrom(in, "b", "", "done:"+textOf(inMessage(in))), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 	ctx := context.Background()
 
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
-	bk, err := newServerSession(ctx, store, el, "a", bootstrap)
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
 	if err != nil {
 		t.Fatalf("newServerSession: %v", err)
 	}
@@ -235,6 +267,30 @@ func pollSessionState(t *testing.T, store *sqlTaskStore, id, want string) *sessi
 	return nil
 }
 
+// pollOwnerPod polls until id's owner_pod equals want or a deadline passes
+// -- ReleaseSession/ClaimSession run in a background goroutine's own
+// deferred chain, asynchronously with whichever caller unblocked when
+// relay() returned, so a test asserting on ownership must poll rather than
+// check immediately.
+func pollOwnerPod(t *testing.T, store *sqlTaskStore, id, want string) *sessionRow {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var last *sessionRow
+	for time.Now().Before(deadline) {
+		row, err := store.GetSession(context.Background(), id)
+		if err != nil {
+			t.Fatalf("GetSession: %v", err)
+		}
+		last = row
+		if row.ownerPod == want {
+			return row
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("session %s's owner_pod never reached %q, last seen: %+v", id, want, last)
+	return nil
+}
+
 // pollTaskIDForSession polls store.TaskIDForSession(sessionID) until it
 // finds one or a deadline passes, for a test whose session's TaskID is
 // only assigned lazily (see bookkeeping.recordTaskStatus) and isn't known
@@ -292,9 +348,8 @@ func TestServerRequestHandler_SendMessage_ThenGetTask_ReachesCompleted(t *testin
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -337,9 +392,8 @@ func TestServerRequestHandler_GetTask_NoTenantResolvesUnambiguously(t *testing.T
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -369,9 +423,8 @@ func TestServerRequestHandler_SendMessage_MessageOnly(t *testing.T) {
 		return replyFrom(in, "a", "", "Direct message response"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -403,9 +456,8 @@ func TestServerRequestHandler_SendMessage_TerminatesSessionOnCompletion(t *testi
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	result, err := h.SendMessage(context.Background(), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
 	})
@@ -433,9 +485,8 @@ func TestServerRequestHandler_SendMessage_TerminatesSessionOnMessageOnlyReply(t 
 		return replyFrom(in, "a", "", "done:"+textOf(inMessage(in))), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	result, err := h.SendMessage(context.Background(), &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
 	})
@@ -465,9 +516,8 @@ func TestServerRequestHandler_SendMessage_WaitsForFullChainByDefault(t *testing.
 		return taskReply(in, "a", "", a2a.TaskStateCompleted, "done"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
 	}
@@ -500,9 +550,8 @@ func TestServerRequestHandler_SendMessage_ReturnsAfterFirstSelfContinuationHop(t
 		return taskReply(in, "a", "", a2a.TaskStateCompleted, "done"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
 		Config:  &a2a.SendMessageConfig{ReturnImmediately: true},
@@ -548,9 +597,8 @@ func TestServerRequestHandler_SendMessage_HandoffNotInHistory(t *testing.T) {
 		return replyFrom(in, "b", "a", "b-answer"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -599,9 +647,8 @@ func TestServerRequestHandler_SendMessage_Continuation(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -666,9 +713,8 @@ func TestServerRequestHandler_GetTask_MessageAfterTaskSkippedNotErrored(t *testi
 		return taskReply(in, "a", "", a2a.TaskStateInputRequired, "need more input"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -700,11 +746,10 @@ func TestServerRequestHandler_GetTask_MessageAfterTaskSkippedNotErrored(t *testi
 // leak into this task's own externally-visible History.
 func TestServerRequestHandler_GetTask_OtherAgentSelfContinuationExcluded(t *testing.T) {
 	c, el, store := newTestServerController(t, nil)
-	defer c.Close()
 	ctx := context.Background()
 
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
-	bk, err := newServerSession(ctx, store, el, "a", bootstrap)
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +788,7 @@ func TestServerRequestHandler_GetTask_OtherAgentSelfContinuationExcluded(t *test
 		t.Fatal(err)
 	}
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	task, err := h.GetTask(ctx, &a2a.GetTaskRequest{ID: taskID, Tenant: bk.sessionID})
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
@@ -777,9 +822,8 @@ func TestServerRequestHandler_SendMessage_InfersContextIDOnContinuation(t *testi
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed"))}
 	result, err := h.SendMessage(context.Background(), req)
 	if err != nil {
@@ -831,9 +875,8 @@ func TestServerRequestHandler_SendMessage_RejectsConcurrentContinuation(t *testi
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	req := &a2a.SendMessageRequest{
 		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
 		// ReturnImmediately: this test needs the session's background
@@ -887,9 +930,8 @@ func TestServerRequestHandler_ListTasks_ScopedToOwnAgent(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-	defer c.Close()
 
-	registry := newTaskRegistry()
+	registry := newTestRegistry(t)
 	hA := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
 	hB := &serverRequestHandler{agent: "b", c: c, el: el, store: store, registry: registry}
 
@@ -927,7 +969,7 @@ func TestServerRequestHandler_GetTask_UnknownIDNotFound(t *testing.T) {
 
 func TestServerRequestHandler_CancelTask_UnknownIDNotFound(t *testing.T) {
 	_, el, store := newTestServerController(t, nil)
-	h := &serverRequestHandler{agent: "a", el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", el: el, store: store, registry: newTestRegistry(t)}
 	if _, err := h.CancelTask(context.Background(), &a2a.CancelTaskRequest{ID: "unknown-task"}); !errors.Is(err, a2a.ErrTaskNotFound) {
 		t.Errorf("CancelTask for an unknown task: err = %v, want a2a.ErrTaskNotFound", err)
 	}
@@ -938,11 +980,13 @@ func TestServerRequestHandler_CancelTask_UnknownIDNotFound(t *testing.T) {
 // directly marked canceled, not met with a blanket ErrTaskNotCancelable.
 func TestServerRequestHandler_CancelTask_PausedTaskSucceeds(t *testing.T) {
 	c, el, store := newTestServerController(t, nil)
-	defer c.Close()
 	ctx := context.Background()
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
 	bootstrap.Data.Message.ContextID = "ctx-1"
-	bk, err := newServerSession(ctx, store, el, "a", bootstrap)
+	// "" podName: this test simulates a session already paused with no
+	// goroutine active, which in real operation means owner_pod has
+	// already been released back to "" -- see awaitOrSubmit's release defer.
+	bk, err := newServerSession(ctx, store, el, "a", "", "", bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +1008,7 @@ func TestServerRequestHandler_CancelTask_PausedTaskSucceeds(t *testing.T) {
 	}
 	taskID := a2a.TaskID(bk.taskID)
 
-	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTaskRegistry()}
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
 	task, err := h.CancelTask(ctx, &a2a.CancelTaskRequest{ID: taskID, Tenant: bk.sessionID})
 	if err != nil {
 		t.Fatalf("CancelTask for a paused task: %v", err)
@@ -1006,10 +1050,9 @@ func TestServerRequestHandler_CancelTask_ActiveTaskStopsRelayNotAgent(t *testing
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 	ctx := context.Background()
 
-	registry := newTaskRegistry()
+	registry := newTestRegistry(t)
 	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
 
 	res, err := h.SendMessage(ctx, &a2a.SendMessageRequest{
@@ -1107,10 +1150,9 @@ func TestResumeServerSessions_SkipsCompletedResumesInFlight(t *testing.T) {
 		return reply, nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": completed, "b": inFlight})
-	defer c.Close()
 	ctx := context.Background()
 
-	registry := newTaskRegistry()
+	registry := newTestRegistry(t)
 
 	// A task already driven to completion via direct SendMessage + poll.
 	hA := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
@@ -1131,12 +1173,12 @@ func TestResumeServerSessions_SkipsCompletedResumesInFlight(t *testing.T) {
 	// must find it via checkpointd_sessions.
 	bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "b", "seed")
 	bootstrap.Data.Message.ContextID = "ctx-in-flight"
-	inFlightSession, err := newServerSession(ctx, store, el, "b", bootstrap)
+	inFlightSession, err := newServerSession(ctx, store, el, "b", "pod-1", "uid-1", bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := resumeServerSessions(ctx, c, el, store, registry); err != nil {
+	if err := resumeServerSessions(ctx, c, el, store, registry, "pod-1", "uid-1"); err != nil {
 		t.Fatalf("resumeServerSessions: %v", err)
 	}
 
@@ -1154,6 +1196,362 @@ func TestResumeServerSessions_SkipsCompletedResumesInFlight(t *testing.T) {
 	}
 }
 
+// TestResumeServerSessions_OnlyResumesOwnInstanceSessions confirms
+// resumeServerSessions only drives sessions owned by the instance ID it's
+// given, leaving a session owned by a different (live-or-restarting-
+// elsewhere) instance strictly alone.
+func TestResumeServerSessions_OnlyResumesOwnInstanceSessions(t *testing.T) {
+	var callsA, callsB int
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		callsA++
+		return taskReply(in, "a", "", a2a.TaskStateCompleted, "done"), nil
+	}}
+	b := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		callsB++
+		return taskReply(in, "b", "", a2a.TaskStateCompleted, "done"), nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	bootstrapA := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+	bootstrapA.Data.Message.ContextID = "ctx-a"
+	ownedByOne, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrapA)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bootstrapB := envNew(a2a.MessageRoleUser, "checkpointd", "b", "seed")
+	bootstrapB.Data.Message.ContextID = "ctx-b"
+	ownedByTwo, err := newServerSession(ctx, store, el, "b", "pod-2", "uid-2", bootstrapB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := resumeServerSessions(ctx, c, el, store, registry, "pod-1", "uid-1"); err != nil {
+		t.Fatalf("resumeServerSessions: %v", err)
+	}
+
+	hA := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: registry}
+	inFlightTaskID := pollTaskIDForSession(t, store, ownedByOne.sessionID)
+	pollTask(t, hA, inFlightTaskID, ownedByOne.sessionID, a2a.TaskStateCompleted)
+	if callsA != 1 {
+		t.Errorf("callsA = %d, want 1 (instance-1's own session must be resumed)", callsA)
+	}
+
+	// Give an incorrect resume of instance-2's session a moment to happen
+	// before asserting it didn't.
+	time.Sleep(50 * time.Millisecond)
+	if callsB != 0 {
+		t.Errorf("callsB = %d, want 0 (a session owned by a different instance must not be touched)", callsB)
+	}
+	row, err := store.GetSession(ctx, ownedByTwo.sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.ownerPod != "pod-2" {
+		t.Errorf("ownedByTwo's owner_pod = %q, want unchanged %q", row.ownerPod, "pod-2")
+	}
+	if row.state != sessionStateRunning {
+		t.Errorf("ownedByTwo's state = %q, want unchanged %q", row.state, sessionStateRunning)
+	}
+}
+
+// TestResumeServerSessions_RestampsStaleOwnerUID confirms a session found by
+// name at startup has its owner_uid restamped to this restart's own live
+// uid, closing the race a concurrent salvage sweep on another instance
+// could otherwise exploit against the row's prior, now-stale uid.
+func TestResumeServerSessions_RestampsStaleOwnerUID(t *testing.T) {
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		return taskReply(in, "a", "", a2a.TaskStateCompleted, "done"), nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "old-uid", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := resumeServerSessions(ctx, c, el, store, registry, "pod-1", "new-uid"); err != nil {
+		t.Fatalf("resumeServerSessions: %v", err)
+	}
+	row := pollOwnerPod(t, store, bk.sessionID, "pod-1")
+	if row.ownerUID != "new-uid" {
+		t.Errorf("owner_uid after resumeServerSessions = %q, want restamped to %q", row.ownerUID, "new-uid")
+	}
+}
+
+// TestResumeServerSessions_PanicsOnRegistryConflict confirms
+// resumeClaimedSession's panic on a registry conflict (see
+// TestResumeClaimedSession_PanicsOnRegistryConflict) propagates straight
+// out of resumeServerSessions too -- neither it nor resumeClaimedSession
+// ever recovers it and reverts instead, since the session's ownership was
+// already durably, successfully restamped to this instance by the time the
+// conflict is discovered, and reverting it here (handing it back to its
+// stale prior owner while whatever already holds the registry entry keeps
+// running) would risk a genuine double-drive, not prevent one.
+func TestResumeServerSessions_PanicsOnRegistryConflict(t *testing.T) {
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		t.Fatal("agent must not be invoked -- the registry conflict must prevent driving, not somehow still drive it")
+		return nil, nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "old-uid", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-occupy the local registry entry to force resumeClaimedSession's
+	// own acquire to fail, simulating the "somehow already has a local
+	// entry" case its own doc comment says should never normally happen.
+	_, preRelease, ok := registry.acquire(ctx, bk.sessionID)
+	if !ok {
+		t.Fatal("pre-acquiring the registry entry failed unexpectedly")
+	}
+	defer preRelease()
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("resumeServerSessions returned normally on a registry conflict, want a panic")
+			}
+		}()
+		resumeServerSessions(ctx, c, el, store, registry, "pod-1", "new-uid") //nolint:errcheck
+		t.Error("unreachable: resumeServerSessions should have panicked")
+	}()
+
+	row, err := store.GetSession(ctx, bk.sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.ownerPod != "pod-1" || row.ownerUID != "new-uid" {
+		t.Errorf("GetSession after a panicked resume = (%q, %q), want left restamped to (%q, %q) -- the panic must skip past resumeServerSessions' own revert-on-error, not trigger it", row.ownerPod, row.ownerUID, "pod-1", "new-uid")
+	}
+}
+
+// TestResumeServerSessions_SkipsWhenConcurrentlySalvaged confirms the
+// outcome the restamp CAS exists to guarantee: once another instance's
+// ClaimOrphanedSession has reassigned a session (simulating a concurrent
+// salvage sweep that won the race), resumeServerSessions must never also
+// spawn a local resume goroutine for that same session -- no double-drive,
+// regardless of whether it's ListResumableSessions' own owner_pod filter or
+// the restamp CAS itself (see TestSQLTaskStore_ClaimOrphanedSession_FailsWhenUIDStale
+// for that CAS's own direct, unit-level proof) that ends up being what
+// excludes it in a given interleaving.
+func TestResumeServerSessions_SkipsWhenConcurrentlySalvaged(t *testing.T) {
+	var calls int
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		calls++
+		return taskReply(in, "a", "", a2a.TaskStateCompleted, "done"), nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "old-uid", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulates another instance's salvage sweep winning the race before
+	// this restart's own resumeServerSessions gets to restamp the row.
+	claimed, err := store.ClaimOrphanedSession(ctx, bk.sessionID, "pod-2", "uid-2", "old-uid")
+	if err != nil {
+		t.Fatalf("ClaimOrphanedSession: %v", err)
+	}
+	if !claimed {
+		t.Fatal("simulated concurrent salvage claim = false, want true")
+	}
+
+	if err := resumeServerSessions(ctx, c, el, store, registry, "pod-1", "new-uid"); err != nil {
+		t.Fatalf("resumeServerSessions: %v", err)
+	}
+	// Give an incorrect resume a moment to happen before asserting it didn't.
+	time.Sleep(50 * time.Millisecond)
+	if calls != 0 {
+		t.Errorf("calls = %d, want 0 (resumeServerSessions must not double-drive a session another instance already salvaged)", calls)
+	}
+	row, err := store.GetSession(ctx, bk.sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.ownerPod != "pod-2" || row.ownerUID != "uid-2" {
+		t.Errorf("GetSession after the race = (%q, %q), want unchanged (%q, %q) -- the concurrent salvage's own claim", row.ownerPod, row.ownerUID, "pod-2", "uid-2")
+	}
+}
+
+// TestResumeClaimedSession_PanicsOnRegistryConflict confirms
+// resumeClaimedSession panics -- rather than returning an error for its
+// caller to revert -- when the local registry already has an active entry
+// for a session it just won a fresh database-level ownership claim for: an
+// already-broken single-owner invariant, not a normal, recoverable race
+// (see TestResumeServerSessions_PanicsOnRegistryConflict and
+// TestSweepOrphanedSessions_PanicsOnRegistryConflict for the same
+// confirmed through each caller).
+func TestResumeClaimedSession_PanicsOnRegistryConflict(t *testing.T) {
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		t.Fatal("agent must not be invoked -- the registry conflict must prevent driving, not somehow still drive it")
+		return nil, nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-a", "uid-a", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-occupy the local registry entry to force resumeClaimedSession's
+	// own acquire to fail, simulating the "somehow already has a local
+	// entry" case its own doc comment says should never normally happen.
+	_, preRelease, ok := registry.acquire(ctx, bk.sessionID)
+	if !ok {
+		t.Fatal("pre-acquiring the registry entry failed unexpectedly")
+	}
+	defer preRelease()
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("resumeClaimedSession returned normally on a registry conflict, want a panic")
+			}
+		}()
+		resumeClaimedSession(ctx, c, el, store, registry, bk.sessionID, sessionStateRunning)
+		t.Error("unreachable: resumeClaimedSession should have panicked")
+	}()
+
+	row, err := store.GetSession(ctx, bk.sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if row.ownerPod != "pod-a" || row.ownerUID != "uid-a" {
+		t.Errorf("GetSession after a panicked resume = (%q, %q), want unchanged (%q, %q) -- resumeClaimedSession itself must not touch ownership", row.ownerPod, row.ownerUID, "pod-a", "uid-a")
+	}
+}
+
+// TestResumeClaimedSession_ErrorsWhenSessionRowVanished confirms the
+// (structurally near-impossible, but defensively handled) case where the
+// session row is no longer found also returns an error, not a silent nil.
+func TestResumeClaimedSession_ErrorsWhenSessionRowVanished(t *testing.T) {
+	_, el, store := newTestServerController(t, nil)
+	ctx := context.Background()
+	registry := newTestRegistry(t)
+
+	if err := resumeClaimedSession(ctx, nil, el, store, registry, "never-created", sessionStateRunning); err == nil {
+		t.Fatal("resumeClaimedSession = nil error, want non-nil when the session row doesn't exist")
+	}
+}
+
+// TestMustReleaseSession_PanicsOnError and TestMustRevertClaim_PanicsOnError
+// confirm the two ownership-release/revert paths never silently swallow a
+// DB error -- they panic instead, crashing this process outright so
+// restartPolicy: Never can hand the session off to a real salvage sweep rather
+// than leaving it claimed by a process that no longer believes it owns it.
+func TestMustReleaseSession_PanicsOnError(t *testing.T) {
+	_, el, store := newTestServerController(t, nil)
+	db, _, ok := eventlog.SQLDB(el)
+	if !ok {
+		t.Fatal("eventlog.SQLDB: not a SQL-backed EventLog")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing the DB out from under the store: %v", err)
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Error("mustReleaseSession returned normally on a DB error, want a panic")
+		}
+	}()
+	mustReleaseSession(context.Background(), store, "some-session")
+	t.Fatal("unreachable: mustReleaseSession should have panicked")
+}
+
+func TestMustRevertClaim_PanicsOnError(t *testing.T) {
+	_, el, store := newTestServerController(t, nil)
+	db, _, ok := eventlog.SQLDB(el)
+	if !ok {
+		t.Fatal("eventlog.SQLDB: not a SQL-backed EventLog")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("closing the DB out from under the store: %v", err)
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Error("mustRevertClaim returned normally on a DB error, want a panic")
+		}
+	}()
+	mustRevertClaim(context.Background(), store, "some-session", "prior-pod", "prior-uid", "claimed-uid")
+	t.Fatal("unreachable: mustRevertClaim should have panicked")
+}
+
+// TestServerRequestHandler_ContinueTask_RejectsWhenClaimedByAnotherInstance
+// confirms continueTask's cross-instance ClaimSession check rejects a
+// session another instance already durably owns, the same way it already
+// rejects a same-process registry conflict.
+func TestServerRequestHandler_ContinueTask_RejectsWhenClaimedByAnotherInstance(t *testing.T) {
+	a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+		// To="" (checkpointdIdentity): a genuine pause, not a self-continuation
+		// -- driveRelayLoop's hop loop only exits on a routing-terminal reply.
+		return taskReply(in, "a", "", a2a.TaskStateInputRequired, "waiting"), nil
+	}}
+	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+	ctx := context.Background()
+
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t), podName: "pod-1"}
+	res, err := h.SendMessage(ctx, &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("seed")),
+	})
+	if err != nil {
+		t.Fatalf("SendMessage (first turn): %v", err)
+	}
+	task, ok := res.(*a2a.Task)
+	if !ok {
+		t.Fatalf("SendMessage result is %T, want *a2a.Task", res)
+	}
+	if task.Status.State != a2a.TaskStateInputRequired {
+		t.Fatalf("Status.State = %q, want %q", task.Status.State, a2a.TaskStateInputRequired)
+	}
+	sessionID, _ := task.Metadata[checkpointdTaskMetaTenant].(string)
+	if sessionID == "" {
+		t.Fatal("task.Metadata carries no session id")
+	}
+
+	// The first turn paused at InputRequired, so awaitOrSubmit's release
+	// defer clears owner_pod -- asynchronously with SendMessage's own
+	// return, so poll for it rather than assuming it's already done.
+	// Then simulate another instance having since claimed the now-released
+	// session (e.g. mid-drive on its own replica).
+	pollOwnerPod(t, store, sessionID, "")
+	claimed, err := store.ClaimSession(ctx, sessionID, "pod-2", "uid-2")
+	if err != nil {
+		t.Fatalf("ClaimSession: %v", err)
+	}
+	if !claimed {
+		t.Fatal("ClaimSession by instance-2 = false, want true (session should have been released)")
+	}
+
+	followUp := &a2a.SendMessageRequest{Message: &a2a.Message{
+		ID:     "follow-up-1",
+		Role:   a2a.MessageRoleUser,
+		Parts:  a2a.ContentParts{a2a.NewTextPart("continue")},
+		TaskID: task.ID,
+	}, Tenant: sessionID}
+	if _, err := h.SendMessage(ctx, followUp); err == nil {
+		t.Fatal("continueTask against a session claimed by another instance = nil error, want one")
+	}
+}
+
 // TestResumeServerSessions_TerminatingSessionFinishesTerminationWithoutRelaying
 // confirms a session that crashed after being durably marked TERMINATING,
 // but before finishTermination ran, resumes straight into finishing that
@@ -1166,12 +1564,11 @@ func TestResumeServerSessions_TerminatingSessionFinishesTerminationWithoutRelayi
 		return taskReply(in, "a", "a", a2a.TaskStateInputRequired, "waiting"), nil
 	}}
 	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
-	defer c.Close()
 	ctx := context.Background()
 
 	// A real actor/hop recorded, no goroutine currently active.
 	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
-	bk, err := newServerSession(ctx, store, el, "a", bootstrap)
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1202,8 +1599,8 @@ func TestResumeServerSessions_TerminatingSessionFinishesTerminationWithoutRelayi
 	}
 	pollSessionState(t, store, bk.sessionID, sessionStateTerminating)
 
-	registry := newTaskRegistry()
-	if err := resumeServerSessions(ctx, c, el, store, registry); err != nil {
+	registry := newTestRegistry(t)
+	if err := resumeServerSessions(ctx, c, el, store, registry, "pod-1", "uid-1"); err != nil {
 		t.Fatalf("resumeServerSessions: %v", err)
 	}
 

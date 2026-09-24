@@ -48,6 +48,7 @@ export KIND_CLUSTER_NAME
 KIND_WORKER_NODES="${KIND_WORKER_NODES:-1}"
 export KIND_WORKER_NODES
 KUBECTL_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+run_kubectl() { kubectl --context "$KUBECTL_CONTEXT" "$@"; }
 
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate}"
 SUBSTRATE_BRANCH="${SUBSTRATE_BRANCH:-main}"
@@ -130,8 +131,6 @@ for f in "$K8S_DIR"/*.yaml; do
   envsubst "$render_vars" < "$f" > "$WORKDIR/$(basename "$f")"
 done
 
-run_kubectl() { kubectl --context "$KUBECTL_CONTEXT" "$@"; }
-
 run_kubectl apply -f "$WORKDIR/00-namespace.yaml"
 run_kubectl apply -f "$WORKDIR/10-workerpool.yaml"
 run_kubectl apply -f "$WORKDIR/05-llama-completion.yaml"
@@ -162,12 +161,17 @@ run_kubectl -n "$NS" wait --for=condition=Ready actortemplate/chat-agent-templat
 run_kubectl -n "$NS" wait --for=condition=Ready actortemplate/reviewer-agent-template --timeout=180s \
   || fail "reviewer-agent-template never became Ready"
 
+log "applying Postgres (shared eventlog/session store for both checkpointd-server replicas)"
+run_kubectl apply -f "$WORKDIR/89-postgres.yaml"
+run_kubectl -n "$NS" rollout status statefulset/postgres --timeout=120s \
+  || fail "postgres never became Ready"
+
 log "applying checkpointd-server (ConfigMap + StatefulSet)"
 run_kubectl apply -f "$WORKDIR/85-checkpointd-configmap.yaml"
 run_kubectl apply -f "$WORKDIR/90-checkpointd-server.yaml"
 
-log "waiting for checkpointd-server to discover both agents (readinessProbe, up to 3 minutes)"
+log "waiting for both checkpointd-server replicas to discover both agents (readinessProbe, up to 3 minutes)"
 run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=180s \
-  || fail "checkpointd-server's readinessProbe never passed -- see 'kubectl -n $NS logs checkpointd-server-0' and 'kubectl -n $NS get actortemplates'"
+  || fail "checkpointd-server's readinessProbe never passed on both replicas -- see 'kubectl -n $NS logs -l app=checkpointd-server --all-containers --prefix', and 'kubectl -n $NS get actortemplates'"
 
 log "PASS -- chat-agent and reviewer-agent are deployed and discovered. Next: examples/llm-chat-demo/demo.sh"

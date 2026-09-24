@@ -37,6 +37,9 @@ jobs:
           - task-state-client2b
           - no-reexecute
           - listtasks-and-notfound
+          - multi-replica-scaling
+          - cancel-task
+          - hanging-instance-salvage
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -63,3 +66,38 @@ jobs:
         run: make test-k8s
         env:
           TEST_K8S_TARGET: ${{ matrix.subtest }}
+
+  llm-chat-demo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # Try to release free disk space https://github.com/actions/runner-images/issues/709
+      - name: cleanup
+        run: |
+          df
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # docker, kind, kubectl, make, git, and jq are already on the
+      # ubuntu-latest runner image; envsubst (gettext-base) is not.
+      - name: Ensure envsubst is available
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+
+      - name: Run examples/llm-chat-demo/setup.sh
+        run: examples/llm-chat-demo/setup.sh
+
+      - name: Run examples/llm-chat-demo/demo.sh
+        run: examples/llm-chat-demo/demo.sh
+
+      - name: Run examples/llm-chat-demo/cleanup.sh
+        if: always()
+        run: examples/llm-chat-demo/cleanup.sh

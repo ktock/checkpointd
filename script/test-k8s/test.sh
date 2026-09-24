@@ -46,6 +46,20 @@
 #   no-reexecute              a completed echo-agent task survives a
 #                             checkpointd-server restart unchanged, not re-driven
 #   listtasks-and-notfound    ListTasks and GetTask-for-an-unknown-id, against echo-agent
+#   multi-replica-scaling     checkpointd-server run as a multi-replica
+#                             StatefulSet on shared Postgres: sessions survive
+#                             cross-instance continuation, scale-up/down, and
+#                             a non-graceful pod force-kill self-recovered by
+#                             the same-named replacement
+#   cancel-task               CancelTask against an actively RUNNING task
+#                             stops its relay loop and cleans up every actor
+#                             it visited, not just records Canceled
+#   hanging-instance-salvage  an instance's own process is paused (SIGSTOP,
+#                             never crashes) while owning a RUNNING session --
+#                             confirms Kubernetes' livenessProbe and
+#                             restartPolicy: Never move it to Failed, then,
+#                             scaled out so it can't self-recover under its
+#                             own name, that a surviving instance salvages it
 #
 # Assumes only docker, kind, kubectl, go, make, git, jq, and envsubst are installed.
 #
@@ -97,7 +111,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 # --- Resolve which subtests to run, and which images/manifests they need ----
 
-SUBTEST_ORDER=(long-poll crash-recovery-from-last-message crash-test-external crash-test-selfpanic tck task-state-a2b task-state-client2b no-reexecute listtasks-and-notfound)
+SUBTEST_ORDER=(long-poll crash-recovery-from-last-message crash-test-external crash-test-selfpanic tck task-state-a2b task-state-client2b no-reexecute listtasks-and-notfound multi-replica-scaling cancel-task hanging-instance-salvage)
 declare -A SUBTESTS=(
   [long-poll]=subtest_long_poll
   [crash-recovery-from-last-message]=subtest_crash_recovery_from_last_message
@@ -108,6 +122,9 @@ declare -A SUBTESTS=(
   [task-state-client2b]=subtest_task_state_client2b
   [no-reexecute]=subtest_no_reexecute
   [listtasks-and-notfound]=subtest_listtasks_and_notfound
+  [multi-replica-scaling]=subtest_multi_replica_scaling
+  [cancel-task]=subtest_cancel_task
+  [hanging-instance-salvage]=subtest_hanging_instance_salvage
 )
 
 target="${TEST_K8S_TARGET:-}"
@@ -158,6 +175,9 @@ declare -A SUBTEST_AGENTS=(
   [task-state-client2b]="agent-b"
   [no-reexecute]="echo"
   [listtasks-and-notfound]="echo"
+  [multi-replica-scaling]="long-wait long-poll agent-b"
+  [cancel-task]="long-wait long-poll"
+  [hanging-instance-salvage]="long-wait long-poll"
 )
 # Subtests that also need the testserver Deployment/Service (its /notify and
 # /wait endpoints).
@@ -166,11 +186,23 @@ declare -A SUBTEST_NEEDS_TESTSERVER=(
   [crash-recovery-from-last-message]=1
   [crash-test-external]=1
   [crash-test-selfpanic]=1
+  [multi-replica-scaling]=1
+  [cancel-task]=1
+  [hanging-instance-salvage]=1
+)
+# Subtests that need checkpointd-server run multi-replica on shared Postgres
+# instead of the plain single-replica/SQLite deployment every other subtest
+# uses -- see 90-postgres-statefulset.yaml and the 91/92 "-postgres" manifest
+# variants.
+declare -A SUBTEST_NEEDS_POSTGRES=(
+  [multi-replica-scaling]=1
+  [hanging-instance-salvage]=1
 )
 
 declare -A NEEDED_AGENTS=()
 NEEDED_TESTSERVER=0
 NEEDED_TCK_RUNNER=0
+NEEDED_POSTGRES=0
 for id in "${run_ids[@]}"; do
   for a in ${SUBTEST_AGENTS[$id]:-}; do
     NEEDED_AGENTS[$a]=1
@@ -180,6 +212,9 @@ for id in "${run_ids[@]}"; do
   fi
   if [[ "$id" == "tck" ]]; then
     NEEDED_TCK_RUNNER=1
+  fi
+  if [[ "${SUBTEST_NEEDS_POSTGRES[$id]:-0}" == "1" ]]; then
+    NEEDED_POSTGRES=1
   fi
 done
 
@@ -330,18 +365,37 @@ log "  agent-b image:           ${AGENT_B_IMAGE:-(skipped, not needed)}"
 
 # --- Render and apply manifests ------------------------------------------------
 
-NEEDED_MANIFEST_FILES=(00-namespace.yaml 10-workerpool.yaml 91-checkpointd-configmap.yaml 92-checkpointd-server-statefulset.yaml)
+CONFIGMAP_FILE="91-checkpointd-configmap.yaml"
+SERVER_MANIFEST_FILE="92-checkpointd-server-statefulset.yaml"
+if [[ "$NEEDED_POSTGRES" == "1" ]]; then
+  CONFIGMAP_FILE="91-checkpointd-configmap-postgres.yaml"
+  SERVER_MANIFEST_FILE="92-checkpointd-server-statefulset-postgres.yaml"
+fi
+
+NEEDED_MANIFEST_FILES=(00-namespace.yaml 10-workerpool.yaml "$CONFIGMAP_FILE" "$SERVER_MANIFEST_FILE")
 if [[ "$NEEDED_TESTSERVER" == "1" ]]; then
   NEEDED_MANIFEST_FILES+=(60-testserver.yaml)
+fi
+if [[ "$NEEDED_POSTGRES" == "1" ]]; then
+  NEEDED_MANIFEST_FILES+=(90-postgres-statefulset.yaml)
 fi
 for a in "${!NEEDED_AGENTS[@]}"; do
   NEEDED_MANIFEST_FILES+=("${AGENT_MANIFEST[$a]}")
 done
 
+# Only meaningful (and only actually referenced by the manifest templates)
+# when NEEDED_POSTGRES=1; harmless, unused envsubst inputs otherwise.
+CHECKPOINTD_REPLICAS="${CHECKPOINTD_REPLICAS:-2}"
+CHECKPOINTD_TERMINATION_GRACE_SECONDS="${CHECKPOINTD_TERMINATION_GRACE_SECONDS:-60}"
+# Short by default so a test doesn't have to wait a real deployment's
+# 1-minute default interval for the salvage loop to pick up an orphan.
+CHECKPOINTD_SALVAGE_SWEEP_INTERVAL="${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL:-5s}"
+
 log "rendering manifests (workdir: $WORKDIR)"
 export NS CHECKPOINTD_IMAGE ECHO_IMAGE LONG_WAIT_IMAGE LONG_POLL_IMAGE TESTSERVER_IMAGE \
-  TCK_AGENT_IMAGE CRASH_TEST_AGENT_IMAGE CRASH_RECOVERY_AGENT_IMAGE AGENT_A_IMAGE AGENT_B_IMAGE ATEOM_IMAGE
-render_vars='${NS} ${CHECKPOINTD_IMAGE} ${ECHO_IMAGE} ${LONG_WAIT_IMAGE} ${LONG_POLL_IMAGE} ${TESTSERVER_IMAGE} ${TCK_AGENT_IMAGE} ${CRASH_TEST_AGENT_IMAGE} ${CRASH_RECOVERY_AGENT_IMAGE} ${AGENT_A_IMAGE} ${AGENT_B_IMAGE} ${ATEOM_IMAGE}'
+  TCK_AGENT_IMAGE CRASH_TEST_AGENT_IMAGE CRASH_RECOVERY_AGENT_IMAGE AGENT_A_IMAGE AGENT_B_IMAGE ATEOM_IMAGE \
+  CHECKPOINTD_REPLICAS CHECKPOINTD_TERMINATION_GRACE_SECONDS CHECKPOINTD_SALVAGE_SWEEP_INTERVAL
+render_vars='${NS} ${CHECKPOINTD_IMAGE} ${ECHO_IMAGE} ${LONG_WAIT_IMAGE} ${LONG_POLL_IMAGE} ${TESTSERVER_IMAGE} ${TCK_AGENT_IMAGE} ${CRASH_TEST_AGENT_IMAGE} ${CRASH_RECOVERY_AGENT_IMAGE} ${AGENT_A_IMAGE} ${AGENT_B_IMAGE} ${ATEOM_IMAGE} ${CHECKPOINTD_REPLICAS} ${CHECKPOINTD_TERMINATION_GRACE_SECONDS} ${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL}'
 for f in "${NEEDED_MANIFEST_FILES[@]}"; do
   envsubst "$render_vars" < "$K8S_DIR/$f" > "$WORKDIR/$f"
 done
@@ -384,21 +438,26 @@ if [[ "$NEEDED_TESTSERVER" == "1" ]]; then
   run_kubectl -n "$NS" rollout status deployment/testserver --timeout=120s
 fi
 
+if [[ "$NEEDED_POSTGRES" == "1" ]]; then
+  log "applying Postgres (shared eventlog/session store for a multi-replica checkpointd-server)"
+  run_kubectl apply -f "$WORKDIR/90-postgres-statefulset.yaml"
+  run_kubectl -n "$NS" rollout status statefulset/postgres --timeout=120s
+fi
+
 log "applying ConfigMap (checkpointd-config)"
-run_kubectl apply -f "$WORKDIR/91-checkpointd-configmap.yaml"
+run_kubectl apply -f "$WORKDIR/$CONFIGMAP_FILE"
 
 log "applying the checkpointd-server StatefulSet"
-run_kubectl apply -f "$WORKDIR/92-checkpointd-server-statefulset.yaml"
+run_kubectl apply -f "$WORKDIR/$SERVER_MANIFEST_FILE"
 
-# --- Wait for checkpointd-server-0, then reach it via the a2a CLI over a kubectl port-forward. ---
+# --- Wait for checkpointd-server to become Ready, then reach it via the a2a CLI over a kubectl port-forward. ---
 
-log "waiting for checkpointd-server-0 to become Ready"
-for i in $(seq 1 60); do
-  run_kubectl -n "$NS" get pod checkpointd-server-0 >/dev/null 2>&1 && break
-  sleep 2
-done
-run_kubectl -n "$NS" wait --for=condition=Ready pod/checkpointd-server-0 --timeout=180s \
-  || { dump_checkpointd_server_logs; fail "checkpointd-server-0 never became Ready; check \`kubectl -n $NS describe pod checkpointd-server-0\`"; }
+# Both the single-replica/SQLite and multi-replica/Postgres manifests are a
+# StatefulSet, so its own rollout status is the direct, correct wait for
+# "every initial replica is Ready" either way.
+log "waiting for every initial checkpointd-server replica to become Ready"
+run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=180s \
+  || { dumpAllCheckpointdServerLogs; fail "checkpointd-server StatefulSet never finished its initial rollout"; }
 
 A2A_CLI_VERSION="v2.5.0" # pinned to the same a2a-go version this repo's go.mod uses (see go.mod)
 log "installing the a2a CLI (github.com/a2aproject/a2a-go/v2/cmd/a2a@$A2A_CLI_VERSION) to a scratch location"

@@ -101,17 +101,22 @@ envsubst '${REVIEWER_AGENT_IMAGE}' < examples/llm-chat-demo/manifests/21-actorte
 
 ## Deploying checkpointd
 
-Checkpointd can be deployed as a StatefulSet providing a volume for saving the event log.
-Checkpointd needs a ServiceAccount granting `get`, `list` and `watch` of actortemplates.ate.dev so that it can collect AgentCards of agents in the cluster.
+Checkpointd is deployed as 2 replicas sharing a Postgres-backed event log, so either replica can pick up a session regardless of which one drove its earlier turns -- including recovering it if the other's own checkpointd process crashes. About replication of the checkpointd instances on a shared database, refer to [./replication.md](./replication.md).
 
-- See [`examples/llm-chat-demo/manifests/90-checkpointd-server.yaml`](../examples/llm-chat-demo/manifests/90-checkpointd-server.yaml) for the example manifest (ServiceAccount/Role/RoleBinding/StatefulSet/Service)
-- See [`examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml`](../examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml) for checkpointd's own config, as a ConfigMap.
+Checkpointd needs a ServiceAccount granting `get`, `list` and `watch` of actortemplates.ate.dev (to collect AgentCards of agents in the cluster), and `get` of pods (for the orphan-session salvage loop. see [`./replication.md`](./replication.md)).
+
+- See [`examples/llm-chat-demo/manifests/89-postgres.yaml`](../examples/llm-chat-demo/manifests/89-postgres.yaml) for the example Postgres manifest.
+- See [`examples/llm-chat-demo/manifests/90-checkpointd-server.yaml`](../examples/llm-chat-demo/manifests/90-checkpointd-server.yaml) for the example manifest (ServiceAccount/Role/RoleBinding/StatefulSet/Service).
+- See [`examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml`](../examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml) for checkpointd's own config, as a ConfigMap, pointing at Postgres.
 
 Supported environment variable:
 
 - `CHECKPOINTD_KUBERNETES_NAMESPACE`(required when running with `--discover`): Kubernetes namespace checkpointd discovers agents from.
 
 ```sh
+kubectl apply -f examples/llm-chat-demo/manifests/89-postgres.yaml
+kubectl -n checkpointd-llm-chat-demo rollout status statefulset/postgres --timeout=120s
+
 REGISTRY=localhost:5001
 CHECKPOINTD_IMAGE=$REGISTRY/checkpointd:dev
 docker build --target checkpointd -f cmd/Dockerfile -t $CHECKPOINTD_IMAGE .
@@ -120,6 +125,8 @@ export CHECKPOINTD_IMAGE
 kubectl apply -f examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml
 envsubst '${CHECKPOINTD_IMAGE}' < examples/llm-chat-demo/manifests/90-checkpointd-server.yaml \
   | kubectl apply -f -
+
+kubectl -n checkpointd-llm-chat-demo rollout status statefulset/checkpointd-server --timeout=180s
 ```
 
 ## Sending requests to the agent
