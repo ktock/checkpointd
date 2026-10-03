@@ -267,6 +267,7 @@ In the callee agent, our custom transport extracts the message contents from thi
 ## Additional resources
 
 - [`./examples/llm-chat-demo`](./examples/llm-chat-demo): Example checkpointd deployment (see Quick Start above)
+- [`./examples/agent-crash-demo`](./examples/agent-crash-demo): Same two-agent shape, but the agent itself crashes on purpose instead of checkpointd
 - [`./docs/caveats.md`](./docs/caveats.md): caveats
 - [`./docs/session.md`](./docs/session.md): resource lifecycle management
 - [`./docs/deployment.md`](./docs/deployment.md): Deployment overview using KinD

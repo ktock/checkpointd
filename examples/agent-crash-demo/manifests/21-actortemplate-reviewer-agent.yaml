@@ -1,0 +1,70 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate for reviewer-agent, built by agents.Dockerfile's `reviewer-agent` target.
+metadata:
+  atespace: checkpointd-agent-crash-demo
+  name: reviewer-agent-template
+workerSelector:
+  matchLabels:
+    workload: checkpointd-agent-crash-demo-harness
+containers:
+  - name: reviewer-agent
+    image: "${REVIEWER_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command:
+      - /app/reviewer-agent
+      - --harness-addr
+      - 0.0.0.0:80
+      - --llama-addr # same in-cluster llama-completion Service chat-agent calls
+      - llama-completion.checkpointd-agent-crash-demo.svc:8080
+    env:
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: reviewer-agent
+      # Only needed so chat-agent has a real card to resolve.
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Reviewer Agent
+          description: >-
+            Gives a second opinion on chat-agent's own answers, using
+            the same llama.cpp completion server -- called by
+            chat-agent, see examples/agent-crash-demo. Never crashes
+            itself.
+          version: 1.0.0
+      # Substrate denies all egress to an actor without a policy, so this lists what the agent calls.
+      - name: CHECKPOINTD_EGRESS_POLICY
+        value: |
+          rules:
+            - hostnames:
+                patterns: ["llama-completion.checkpointd-agent-crash-demo.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/checkpointd-agent-crash-demo/reviewer-agent/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

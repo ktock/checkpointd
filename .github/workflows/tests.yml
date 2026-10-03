@@ -101,3 +101,47 @@ jobs:
       - name: Run examples/llm-chat-demo/cleanup.sh
         if: always()
         run: examples/llm-chat-demo/cleanup.sh
+
+  agent-crash-demo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      # Try to release free disk space https://github.com/actions/runner-images/issues/709
+      - name: cleanup
+        run: |
+          df
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # docker, kind, kubectl, make, git, and jq are already on the
+      # ubuntu-latest runner image; envsubst (gettext-base) is not.
+      - name: Ensure envsubst is available
+        run: sudo apt-get update && sudo apt-get install -y gettext-base
+
+      - name: Run examples/agent-crash-demo/setup.sh
+        run: examples/agent-crash-demo/setup.sh
+
+      # demo.sh is interactive and ends when its stdin does, so the turns are piped in.
+      - name: Run examples/agent-crash-demo/demo.sh
+        run: |
+          printf '%s\n' \
+            "Hi, I'm Foo." \
+            "What is my name?" \
+            "I like tea." \
+            "What do I like?" \
+            "Summarize what you know about me." \
+            "Goodbye." \
+            | examples/agent-crash-demo/demo.sh
+
+      - name: Run examples/agent-crash-demo/cleanup.sh
+        if: always()
+        run: examples/agent-crash-demo/cleanup.sh
