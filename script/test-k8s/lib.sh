@@ -49,6 +49,12 @@ dump_checkpointd_server_logs() {
   run_kubectl -n "$NS" logs pod/checkpointd-server-0 2>&1 | sed 's/^/[checkpointd-server] /' >&2 || true
 }
 
+# dump_egress_denials prints what the egress gateway denied, since an outbound call an agent was refused shows up only there.
+dump_egress_denials() {
+  log "--- atenet-egress denials ---"
+  run_kubectl -n ate-system logs deployment/atenet-egress --all-containers 2>&1 | grep -a "egress denied" | tail -20 | sed 's/^/[atenet-egress] /' >&2 || true
+}
+
 # dumpAllCheckpointdServerLogs prints every checkpointd-server replica's own
 # logs.
 dumpAllCheckpointdServerLogs() {
@@ -256,7 +262,7 @@ resolveWorkerPod() {
     session_id="$(echo "$task_out" | jq -r '.metadata["checkpointd-tenant"] // empty' 2>/dev/null)"
     if [[ -n "$session_id" ]]; then
       actor_name="$(actorName "$session_id" "$agent")"
-      a="$(run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null | jq -c --arg name "$actor_name" '[.actors[] | select(.metadata.name == $name)] | .[0] // empty' 2>/dev/null)"
+      a="$(run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null | jq -c --arg name "$actor_name" '[.actors[] | select(.metadata.name == $name)] | .[0] // empty' 2>/dev/null)"
       if [[ -n "$a" && "$a" != "empty" && "$a" != "null" ]]; then
         worker_ns="$(echo "$a" | jq -r '.status.workerAssignment.workerNamespace // empty')"
         worker_pod="$(echo "$a" | jq -r '.status.workerAssignment.workerPod // empty')"

@@ -26,6 +26,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// DefaultTarget is the in-cluster Control API address used when no target is given.
+const DefaultTarget = "api.ate-system.svc:443"
+
 type Client struct {
 	namespace string
 	template  string
@@ -41,7 +44,7 @@ func NewClient(ns, template, target string, opts ...grpc.DialOption) (*Client, e
 		return nil, fmt.Errorf("template cannot be empty")
 	}
 	if target == "" {
-		target = "api.ate-system.svc:443"
+		target = DefaultTarget
 	}
 	if len(opts) == 0 {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -68,9 +71,8 @@ func (c *Client) CreateActor(ctx context.Context, id string) (*ateapipb.Actor, e
 	}
 	actor, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
 		Actor: &ateapipb.Actor{
-			Metadata:               &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: id},
-			ActorTemplateNamespace: c.namespace,
-			ActorTemplateName:      c.template,
+			Metadata:      &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: id},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: c.namespace, Name: c.template},
 		},
 	})
 	if err != nil {
@@ -91,64 +93,17 @@ func (c *Client) GetActor(ctx context.Context, id string) (*ateapipb.Actor, erro
 	return actor, nil
 }
 
-// CreateActorSnapshotTag pins snapshot under tagName, a durable alias that
-// survives deleting the actor that produced it.
-func (c *Client) CreateActorSnapshotTag(ctx context.Context, tagName string, snapshot *ateapipb.ObjectRef) (*ateapipb.ActorSnapshotTag, error) {
+// RevertActor discards the actor's current execution and returns it to SUSPENDED
+// at its last completed snapshot, which is how a CRASHED actor is recovered.
+func (c *Client) RevertActor(ctx context.Context, id string) (*ateapipb.Actor, error) {
 	client := ateapipb.NewControlClient(c.conn)
-	tag, err := client.CreateActorSnapshotTag(ctx, &ateapipb.CreateActorSnapshotTagRequest{
-		ActorSnapshotTag: &ateapipb.ActorSnapshotTag{
-			Metadata: &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: tagName},
-			Snapshot: snapshot,
-			Scope:    ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_ATESPACE,
-		},
+	resp, err := client.RevertActor(ctx, &ateapipb.RevertActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: c.namespace, Name: id},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error when calling Control.CreateActorSnapshotTag: %w", err)
+		return nil, fmt.Errorf("error when calling Control.RevertActor: %w", err)
 	}
-	return tag, nil
-}
-
-// GetActorSnapshotTag retrieves tagName's current definition, including which
-// ActorSnapshot it points at.
-func (c *Client) GetActorSnapshotTag(ctx context.Context, tagName string) (*ateapipb.ActorSnapshotTag, error) {
-	client := ateapipb.NewControlClient(c.conn)
-	tag, err := client.GetActorSnapshotTag(ctx, &ateapipb.GetActorSnapshotTagRequest{
-		ActorSnapshotTag: &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error when calling Control.GetActorSnapshotTag: %w", err)
-	}
-	return tag, nil
-}
-
-// DeleteActorSnapshotTag removes tagName, treating an already-gone tag as success.
-func (c *Client) DeleteActorSnapshotTag(ctx context.Context, tagName string) error {
-	client := ateapipb.NewControlClient(c.conn)
-	_, err := client.DeleteActorSnapshotTag(ctx, &ateapipb.DeleteActorSnapshotTagRequest{
-		ActorSnapshotTag: &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
-	})
-	if err != nil && status.Code(err) != codes.NotFound {
-		return fmt.Errorf("error when calling Control.DeleteActorSnapshotTag: %w", err)
-	}
-	return nil
-}
-
-// CreateActorFromSnapshotTag creates a new actor named id, already SUSPENDED and seeded
-// from the ActorSnapshot tagName points at.
-func (c *Client) CreateActorFromSnapshotTag(ctx context.Context, id, tagName string) (*ateapipb.Actor, error) {
-	client := ateapipb.NewControlClient(c.conn)
-	actor, err := client.CreateActor(ctx, &ateapipb.CreateActorRequest{
-		Actor: &ateapipb.Actor{
-			Metadata:               &ateapipb.ResourceMetadata{Atespace: c.namespace, Name: id},
-			ActorTemplateNamespace: c.namespace,
-			ActorTemplateName:      c.template,
-			SourceSnapshotTag:      &ateapipb.ObjectRef{Atespace: c.namespace, Name: tagName},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error when calling Control.CreateActor (from snapshot tag): %w", err)
-	}
-	return actor, nil
+	return resp.GetActor(), nil
 }
 
 // ResumeActor resumes the actor, scheduling it onto a worker. The returned

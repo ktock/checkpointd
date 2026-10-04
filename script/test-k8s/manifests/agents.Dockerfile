@@ -15,7 +15,7 @@
 # Builds the test agents used by script/test-k8s, one --target per binary: echo, long-wait, long-poll, testserver, tck-agent, crash-test-agent, crash-recovery-agent, agent-a, agent-b.
 #   docker build --target echo -f script/test-k8s/manifests/agents.Dockerfile -t <ref> . && docker push <ref>
 
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src

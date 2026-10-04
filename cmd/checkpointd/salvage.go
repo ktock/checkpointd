@@ -18,6 +18,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/ktock/checkpointd/internal/controller"
@@ -28,6 +30,25 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// serviceAccountNamespaceFile is where Kubernetes tells a pod its own namespace.
+const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+// ownNamespace returns the Kubernetes namespace checkpointd's own pods run in, preferring the --namespace override over the namespace file.
+func ownNamespace(override, namespaceFile string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	b, err := os.ReadFile(namespaceFile)
+	if err != nil {
+		return "", fmt.Errorf("finding this pod's own namespace (set --namespace to override): %w", err)
+	}
+	ns := strings.TrimSpace(string(b))
+	if ns == "" {
+		return "", fmt.Errorf("%s is empty (set --namespace to override)", namespaceFile)
+	}
+	return ns, nil
+}
 
 // podExistenceChecker abstracts the real Kubernetes Pod check the salvage
 // sweep needs, so its own logic can be unit tested against a fake, with no

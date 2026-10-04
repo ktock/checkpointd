@@ -19,21 +19,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
 	"time"
 
-	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
-	ateclientset "github.com/agent-substrate/substrate/pkg/client/clientset/versioned"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/ktock/checkpointd/internal/ate"
 	config "github.com/ktock/checkpointd/internal/config/checkpointd"
 	"github.com/ktock/checkpointd/internal/controller"
 	"github.com/ktock/checkpointd/internal/harness"
 	"github.com/ktock/checkpointd/internal/harness/substrate"
 	"gopkg.in/yaml.v3"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/rest"
 )
 
 const (
@@ -50,51 +47,49 @@ const (
 	// omits this or malformed is logged and skipped entirely.
 	checkpointdAgentCardEnv = "CHECKPOINTD_AGENT_CARD"
 
+	// checkpointdEgressPolicyEnv optionally carries the egress policy rules every actor of this agent gets,
+	// in Substrate's protojson shape as JSON or YAML, because Substrate denies all egress to an actor without a policy.
+	checkpointdEgressPolicyEnv = "CHECKPOINTD_EGRESS_POLICY"
+
 	// checkpointdHarnessPortEnv optionally overrides defaultHarnessPort with the
 	// port this agent's own HarnessService actually listens on.
 	checkpointdHarnessPortEnv = "CHECKPOINTD_HARNESS_PORT"
 
 	// defaultHarnessPort is used when checkpointdHarnessPortEnv is unset.
 	defaultHarnessPort = 80
-
-	// checkpointdNamespaceEnv is the target namespace to discover agents.
-	checkpointdNamespaceEnv = "CHECKPOINTD_KUBERNETES_NAMESPACE"
 )
 
-// newDiscoveryClient builds the typed Kubernetes clientset discoverAgents
-// uses to list ActorTemplate CRDs. Note that Substrate Control API's own
-// ListActorTemplates RPC only reads agents populated by an explicit
-// CreateActorTemplate call.
-func newDiscoveryClient() (ateclientset.Interface, error) {
-	// authenticates as checkpointd-server pod's ServiceAccount.
-	cfg, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("loading in-cluster Kubernetes config (--discover only works in a real cluster): %w", err)
-	}
-	return ateclientset.NewForConfig(cfg)
+// templateLister lists the ActorTemplates in an atespace, or in all atespaces when it is empty.
+type templateLister interface {
+	ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error)
 }
 
-// discoverAgents lists every ActorTemplate and returns the harness.Harness
+// newDiscoveryClient builds the Control API client discoverAgents lists ActorTemplates through.
+func newDiscoveryClient(endpoint string, ctrlOpts substrate.ControlAPIOptions) (*ate.TemplateLister, error) {
+	return substrate.NewTemplateLister(endpoint, ctrlOpts)
+}
+
+// discoverAgents lists every ActorTemplate in atespace (every atespace when it is empty) and returns the harness.Harness
 // set, per-agent AgentCard content checkpointd needs, and the raw
-// ActorTemplate names Kubernetes reported.
-func discoverAgents(ctx context.Context, cs ateclientset.Interface, endpoint string, ctrlOpts substrate.ControlAPIOptions) (map[string]harness.Harness, map[string]*config.AgentCardConfig, []string, error) {
-	list, err := cs.ApiV1alpha1().ActorTemplates(os.Getenv(checkpointdNamespaceEnv)).List(ctx, metav1.ListOptions{})
+// ActorTemplate names the Control API reported.
+func discoverAgents(ctx context.Context, lister templateLister, atespace, endpoint string, ctrlOpts substrate.ControlAPIOptions) (map[string]harness.Harness, map[string]*config.AgentCardConfig, []string, error) {
+	templates, err := lister.ListActorTemplates(ctx, atespace)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("listing ActorTemplates: %w", err)
 	}
 	var names []string
-	for _, t := range list.Items {
-		names = append(names, t.Namespace+"/"+t.Name)
+	for _, t := range templates {
+		names = append(names, t.GetMetadata().GetAtespace()+"/"+t.GetMetadata().GetName())
 	}
-	harnesses, cards := agentsFromTemplates(list.Items, endpoint, ctrlOpts)
+	harnesses, cards := agentsFromTemplates(templates, endpoint, ctrlOpts)
 	return harnesses, cards, names, nil
 }
 
-func agentsFromTemplates(templates []atev1alpha1.ActorTemplate, endpoint string, ctrlOpts substrate.ControlAPIOptions) (map[string]harness.Harness, map[string]*config.AgentCardConfig) {
+func agentsFromTemplates(templates []*ateapipb.ActorTemplate, endpoint string, ctrlOpts substrate.ControlAPIOptions) (map[string]harness.Harness, map[string]*config.AgentCardConfig) {
 	harnesses := make(map[string]harness.Harness)
 	cards := make(map[string]*config.AgentCardConfig)
 	for i := range templates {
-		tmpl := &templates[i]
+		tmpl := templates[i]
 		env, ok := checkpointdAgentEnvVars(tmpl)
 		if !ok {
 			continue
@@ -102,10 +97,10 @@ func agentsFromTemplates(templates []atev1alpha1.ActorTemplate, endpoint string,
 
 		id := env[checkpointdAgentIDEnv]
 		if id == "" {
-			id = tmpl.Name
+			id = tmpl.GetMetadata().GetName()
 		}
 		if id == "" {
-			log.Infof("discovery: ActorTemplate in namespace %q has no name and no %s override, skipping", tmpl.Namespace, checkpointdAgentIDEnv)
+			log.Infof("discovery: ActorTemplate in atespace %q has no name and no %s override, skipping", tmpl.GetMetadata().GetAtespace(), checkpointdAgentIDEnv)
 			continue
 		}
 		if _, dup := harnesses[id]; dup {
@@ -135,11 +130,21 @@ func agentsFromTemplates(templates []atev1alpha1.ActorTemplate, endpoint string,
 			}
 		}
 
-		h, err := substrate.New(id, endpoint, tmpl.Namespace, tmpl.Name, port, 0, ctrlOpts)
+		var egressPolicy *ateapipb.EgressPolicy
+		if raw := env[checkpointdEgressPolicyEnv]; raw != "" {
+			egressPolicy, err = ate.ParseEgressPolicy([]byte(raw))
+			if err != nil {
+				log.Infof("discovery: agent %q: parsing %s: %v", id, checkpointdEgressPolicyEnv, err)
+				continue
+			}
+		}
+
+		h, err := substrate.New(id, endpoint, tmpl.GetMetadata().GetAtespace(), tmpl.GetMetadata().GetName(), port, 0, ctrlOpts)
 		if err != nil {
 			log.Infof("discovery: agent %q: building harness: %v", id, err)
 			continue
 		}
+		h.SetEgressPolicy(egressPolicy)
 		harnesses[id] = h
 		cards[id] = card
 	}
@@ -160,11 +165,11 @@ func parseAgentCardEnv(raw string) (*config.AgentCardConfig, error) {
 
 // checkpointdAgentEnvVars returns the env vars of tmpl's first container that
 // sets checkpointdAgentEnv to "true".
-func checkpointdAgentEnvVars(tmpl *atev1alpha1.ActorTemplate) (map[string]string, bool) {
-	for _, c := range tmpl.Spec.Containers {
-		env := make(map[string]string, len(c.Env))
-		for _, e := range c.Env {
-			env[e.Name] = e.Value
+func checkpointdAgentEnvVars(tmpl *ateapipb.ActorTemplate) (map[string]string, bool) {
+	for _, c := range tmpl.GetContainers() {
+		env := make(map[string]string, len(c.GetEnv()))
+		for _, e := range c.GetEnv() {
+			env[e.GetName()] = e.GetValue()
 		}
 		if env[checkpointdAgentEnv] == "true" {
 			return env, true
@@ -191,8 +196,8 @@ func (s *discoveryState) changed(ids []string) bool {
 // live-swaps reg's harness set via Registry.Replace and stores the result in
 // cards for buildDynamicServerMux's routing. Only logs when the discovered
 // agent set differs from state's own last-seen one.
-func discoverAndApply(ctx context.Context, cs ateclientset.Interface, endpoint string, ctrlOpts substrate.ControlAPIOptions, reg *controller.Registry, cards *agentCardStore, state *discoveryState) error {
-	harnesses, newCards, names, err := discoverAgents(ctx, cs, endpoint, ctrlOpts)
+func discoverAndApply(ctx context.Context, lister templateLister, atespace, endpoint string, ctrlOpts substrate.ControlAPIOptions, reg *controller.Registry, cards *agentCardStore, state *discoveryState) error {
+	harnesses, newCards, names, err := discoverAgents(ctx, lister, atespace, endpoint, ctrlOpts)
 	if err != nil {
 		return err
 	}
@@ -208,13 +213,13 @@ func discoverAndApply(ctx context.Context, cs ateclientset.Interface, endpoint s
 	sort.Strings(agentIDs)
 
 	if state.changed(agentIDs) {
-		log.Infof("discovery: Kubernetes reported %d ActorTemplate(s): %v", len(names), names)
+		log.Infof("discovery: the Control API reported %d ActorTemplate(s): %v", len(names), names)
 		log.Infof("discovery: found %d agent(s): %v", len(agentIDs), agentIDs)
 	}
 	return nil
 }
 
-func runDiscoveryLoop(ctx context.Context, cs ateclientset.Interface, endpoint string, ctrlOpts substrate.ControlAPIOptions, reg *controller.Registry, cards *agentCardStore, interval time.Duration, state *discoveryState) {
+func runDiscoveryLoop(ctx context.Context, lister templateLister, atespace, endpoint string, ctrlOpts substrate.ControlAPIOptions, reg *controller.Registry, cards *agentCardStore, interval time.Duration, state *discoveryState) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -222,7 +227,7 @@ func runDiscoveryLoop(ctx context.Context, cs ateclientset.Interface, endpoint s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := discoverAndApply(ctx, cs, endpoint, ctrlOpts, reg, cards, state); err != nil {
+			if err := discoverAndApply(ctx, lister, atespace, endpoint, ctrlOpts, reg, cards, state); err != nil {
 				log.Infof("discovery: %v, keeping previous agent set", err)
 			}
 		}

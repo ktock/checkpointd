@@ -489,12 +489,6 @@ type actorDeleter interface {
 	DeleteActor(ctx context.Context, actorID string) error
 }
 
-// crashTagDeleter is implemented by harnesses that can leave behind a
-// crash-recovery snapshot tag keyed off an actor id.
-type crashTagDeleter interface {
-	DeleteCrashRecoveryTag(ctx context.Context, actorID string) error
-}
-
 // cleanupActors deletes every private actor this run created, now that the
 // run has reached a terminal reply and none of them will ever be revisited.
 func cleanupActors(ctx context.Context, c *controller.Controller, bk *bookkeeping) {
@@ -506,18 +500,13 @@ func cleanupActors(ctx context.Context, c *controller.Controller, bk *bookkeepin
 	for actorID, agent := range actors {
 		h, err := c.Registry().Harness(agent)
 		if err != nil {
-			log.Infof("cleanup: could not look up harness %s: %v", agent, err)
+			log.Infof("cleanup: could not look up harness %s, so actor %s is left behind: %v", agent, actorID, err)
 			continue
 		}
 		if deleter, ok := h.(actorDeleter); ok {
 			log.Infof("cleanup: deleting actor %s (%s)", actorID, agent)
 			if err := deleter.DeleteActor(ctx, actorID); err != nil {
 				log.Infof("cleanup: could not delete actor %s (%s): %v", actorID, agent, err)
-			}
-		}
-		if tagDeleter, ok := h.(crashTagDeleter); ok {
-			if err := tagDeleter.DeleteCrashRecoveryTag(ctx, actorID); err != nil {
-				log.Infof("cleanup: could not delete crash-recovery tag for actor %s (%s): %v", actorID, agent, err)
 			}
 		}
 	}

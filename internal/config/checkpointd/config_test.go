@@ -161,3 +161,33 @@ func TestLoadFromBytes_Invalid(t *testing.T) {
 		t.Fatal("LoadFromBytes(invalid): got nil error, want error")
 	}
 }
+
+func TestSubstrateNewHarness_EgressPolicyFromConfig(t *testing.T) {
+	var sc SubstrateHarnessConfig
+	if err := yaml.Unmarshal([]byte(`
+id: c
+namespace: team-ns
+template: custom-template
+egress_policy:
+  rules:
+    - hostnames:
+        patterns: ["llama.team-ns.svc"]
+`), &sc); err != nil {
+		t.Fatalf("yaml.Unmarshal: %v", err)
+	}
+	h, err := sc.NewHarness("api.ate-system.svc:443", substrate.ControlAPIOptions{})
+	if err != nil {
+		t.Fatalf("NewHarness: %v", err)
+	}
+	rules := h.(*substrate.SubstrateHarness).EgressPolicy().GetRules()
+	if len(rules) != 1 || rules[0].GetHostnames().GetPatterns()[0] != "llama.team-ns.svc" {
+		t.Errorf("egress policy rules = %v, want the configured rule", rules)
+	}
+}
+
+func TestSubstrateNewHarness_InvalidEgressPolicyIsRejected(t *testing.T) {
+	_, err := SubstrateHarnessConfig{ID: "c", Namespace: "ns", Template: "t", EgressPolicy: map[string]any{"rulez": []any{}}}.NewHarness("api.ate-system.svc:443", substrate.ControlAPIOptions{})
+	if err == nil || !strings.Contains(err.Error(), `substrate harness "c"`) {
+		t.Errorf("NewHarness error = %v, want one naming the harness", err)
+	}
+}

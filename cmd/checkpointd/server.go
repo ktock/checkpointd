@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -52,6 +53,8 @@ var (
 	servePodName                   string
 	servePodUID                    string
 	serveSalvageSweepInterval      time.Duration
+	serveDiscoverAtespace          string
+	serveNamespace                 string
 )
 
 func init() {
@@ -59,8 +62,10 @@ func init() {
 	rootCmd.Flags().StringVar(&serveConfigFile, "config", "/etc/checkpointd/checkpointd.yaml", "Path to the configuration file")
 	rootCmd.Flags().StringVar(&serveAddr, "addr", ":80", "address to serve on")
 	rootCmd.Flags().StringVar(&serveBaseURL, "base-url", "http://localhost:80", "this server's own externally-reachable base URL, stamped into each agent's AgentCard (e.g. http://checkpointd.<namespace>.svc:80)")
-	rootCmd.Flags().BoolVar(&serveDiscover, "discover", false, "discover agents from Kubernetes ActorTemplate CRDs instead of the config file. Requires an in-cluster ServiceAccount granted get/list/watch on actortemplates.ate.dev")
-	rootCmd.Flags().DurationVar(&serveDiscoveryInterval, "discovery-interval", 30*time.Second, "how often to re-list ActorTemplate CRDs when --discover is set")
+	rootCmd.Flags().BoolVar(&serveDiscover, "discover", false, "discover agents from Agent Substrate ActorTemplates, listed through the Control API, instead of the config file")
+	rootCmd.Flags().StringVar(&serveDiscoverAtespace, "discover-atespace", "", "the Agent Substrate atespace --discover lists ActorTemplates from; empty discovers agents from every atespace")
+	rootCmd.Flags().StringVar(&serveNamespace, "namespace", "", "the Kubernetes namespace checkpointd's own pods run in, where the salvage loop looks up the pods that own sessions; empty reads it from the namespace file Kubernetes mounts next to the service account token")
+	rootCmd.Flags().DurationVar(&serveDiscoveryInterval, "discovery-interval", 30*time.Second, "how often to re-list ActorTemplates when --discover is set")
 	rootCmd.Flags().StringVar(&serveSubstrateEndpoint, "substrate-endpoint", "", "Agent Substrate Control API address each discovered agent's harness dials; empty uses the ate package's own default")
 	rootCmd.Flags().StringVar(&serveSubstrateCAFile, "substrate-ca-file", "", "PEM file with the Agent Substrate Control API's trust bundle (e.g. a mounted clusterTrustBundle projected volume), used to verify its server certificate; empty trusts any certificate, which is only appropriate for local testing.")
 	rootCmd.Flags().StringVar(&serveSubstrateTokenFile, "substrate-token-file", "/var/run/secrets/ate-system/token", "bearer token file for the Agent Substrate Control API, re-read on every call; its existence also decides whether a worker is dialed directly (file absent: local/testing) or CONNECT-tunneled through atenet-router (file present: a real cluster's NetworkPolicy requires it)")
@@ -110,40 +115,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating task store: %w", err)
 	}
 
-	registry := newTaskRegistry()
-
-	if err := resumeServerSessions(ctx, c, el, store, registry, servePodName, servePodUID); err != nil {
-		return fmt.Errorf("resuming server sessions: %w", err)
-	}
-
-	if servePodName != "" && servePodUID != "" {
-		checker, err := newPodExistenceChecker()
-		if err != nil {
-			return fmt.Errorf("creating salvage pod existence checker: %w", err)
-		}
-		namespace := os.Getenv(checkpointdNamespaceEnv)
-		log.Infof("pod %s (uid %s): starting the orphan-session salvage loop (interval %s)", servePodName, servePodUID, serveSalvageSweepInterval)
-		go runSalvageLoop(ctx, c, el, store, registry, checker, namespace, servePodName, servePodUID, serveSalvageSweepInterval)
-	} else {
-		log.Infof("pod %s: --pod-name/--pod-uid not set, not running the orphan-session salvage loop (SQLite/single-replica)", servePodName)
-	}
-
-	if serveLogRetentionPeriod > 0 {
-		go runRetentionLoop(ctx, db, registry, serveLogRetentionPeriod, serveLogRetentionSweepInterval)
-	}
-
+	// Agents are registered before any session is resumed, because resuming a session looks its harness up by name.
 	var cards *agentCardStore
 	if serveDiscover {
-		disc, err := newDiscoveryClient()
+		disc, err := newDiscoveryClient(serveSubstrateEndpoint, ctrlOpts)
 		if err != nil {
 			return fmt.Errorf("creating discovery client: %w", err)
 		}
+		defer disc.Close()
 		cards = newAgentCardStore(nil)
 		discState := &discoveryState{}
-		if err := discoverAndApply(ctx, disc, serveSubstrateEndpoint, ctrlOpts, c.Registry(), cards, discState); err != nil {
+		if err := discoverAndApply(ctx, disc, serveDiscoverAtespace, serveSubstrateEndpoint, ctrlOpts, c.Registry(), cards, discState); err != nil {
 			return fmt.Errorf("initial agent discovery: %w", err)
 		}
-		go runDiscoveryLoop(ctx, disc, serveSubstrateEndpoint, ctrlOpts, c.Registry(), cards, serveDiscoveryInterval, discState)
+		go runDiscoveryLoop(ctx, disc, serveDiscoverAtespace, serveSubstrateEndpoint, ctrlOpts, c.Registry(), cards, serveDiscoveryInterval, discState)
 	} else {
 		agentCards := make(map[string]*config.AgentCardConfig, len(cfg.Registry.Substrate))
 		for _, sc := range cfg.Registry.Substrate {
@@ -154,6 +139,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		cards = newAgentCardStore(agentCards)
 	}
+
+	registry := newTaskRegistry()
+
 	draining := &atomic.Bool{}
 	mux := buildServerMux(cards, serveBaseURL, c, el, store, registry, servePodName, servePodUID, draining)
 
@@ -186,12 +174,83 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	ln, err := net.Listen("tcp", serveAddr)
+	if err != nil {
+		return err
+	}
 	log.Infof("server listening on %s", serveAddr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	// Sessions are resumed only once agents can reach this server at --base-url, because a resumed agent fetches other agents' cards from it right away.
+	if !waitForBaseURL(ctx, serveBaseURL, baseURLReachableTimeout, baseURLProbeInterval) {
+		if ctx.Err() != nil {
+			<-shutdownDone
+			return nil
+		}
+		_ = srv.Close()
+		return fmt.Errorf("--base-url %s did not answer within %s, so agents could not fetch agent cards from it", serveBaseURL, baseURLReachableTimeout)
+	}
+
+	if err := resumeServerSessions(ctx, c, el, store, registry, servePodName, servePodUID); err != nil {
+		return fmt.Errorf("resuming server sessions: %w", err)
+	}
+
+	if servePodName != "" && servePodUID != "" {
+		checker, err := newPodExistenceChecker()
+		if err != nil {
+			return fmt.Errorf("creating salvage pod existence checker: %w", err)
+		}
+		namespace, err := ownNamespace(serveNamespace, serviceAccountNamespaceFile)
+		if err != nil {
+			return fmt.Errorf("salvage needs the namespace of checkpointd's own pods: %w", err)
+		}
+		log.Infof("pod %s (uid %s): starting the orphan-session salvage loop (interval %s)", servePodName, servePodUID, serveSalvageSweepInterval)
+		go runSalvageLoop(ctx, c, el, store, registry, checker, namespace, servePodName, servePodUID, serveSalvageSweepInterval)
+	} else {
+		log.Infof("pod %s: --pod-name/--pod-uid not set, not running the orphan-session salvage loop (SQLite/single-replica)", servePodName)
+	}
+
+	if serveLogRetentionPeriod > 0 {
+		go runRetentionLoop(ctx, db, registry, serveLogRetentionPeriod, serveLogRetentionSweepInterval)
+	}
+
+	if err := <-serveErr; err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	<-shutdownDone
 	return nil
+}
+
+// baseURLReachableTimeout bounds how long startup waits for this server to answer at --base-url.
+const baseURLReachableTimeout = 30 * time.Second
+
+// baseURLProbeInterval is how often startup probes --base-url while waiting.
+const baseURLProbeInterval = 500 * time.Millisecond
+
+// waitForBaseURL polls baseURL's /ready until it answers 200, and reports whether that happened before timeout or ctx ended.
+func waitForBaseURL(ctx context.Context, baseURL string, timeout, interval time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := strings.TrimSuffix(baseURL, "/") + "/ready"
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return false
+		}
+		if resp, err := client.Do(req); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(interval):
+		}
+	}
 }
 
 // agentCardStore holds the current set of externally exposed agents'

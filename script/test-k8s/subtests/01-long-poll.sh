@@ -54,22 +54,22 @@ subtest_long_poll() {
   expect_name_1="$(actorName "$tenant_1" long-wait)"
   expect_name_2="$(actorName "$tenant_2" long-wait)"
   for i in $(seq 1 60); do
-    actors_json="$(run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null)"
-    wait_actor_count="$(echo "$actors_json" | jq -r '[.actors[] | select(.actorTemplateName=="long-wait-template")] | length')"
-    wait_actor_names="$(echo "$actors_json" | jq -r '[.actors[] | select(.actorTemplateName=="long-wait-template")] | .[].metadata.name' | tr '\n' ' ')"
+    actors_json="$(run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null)"
+    wait_actor_count="$(echo "$actors_json" | jq -r '[.actors[] | select(.actorTemplate.name=="long-wait-template")] | length')"
+    wait_actor_names="$(echo "$actors_json" | jq -r '[.actors[] | select(.actorTemplate.name=="long-wait-template")] | .[].metadata.name' | tr '\n' ' ')"
     [[ "$wait_actor_count" == "2" ]] && break
     sleep 3
   done
   [[ "$wait_actor_count" == "2" ]] \
-    || fail "expected 2 distinct long-wait actors (one per concurrent task), found $wait_actor_count (names seen: [$wait_actor_names]; expected $expect_name_1 for tenant_1=$tenant_1 and $expect_name_2 for tenant_2=$tenant_2) -- the two tasks may be sharing one actor"
+    || { dump_checkpointd_server_logs; dump_egress_denials; run_kubectl_ate get actors -a "$ATESPACE" >&2 || true; fail "expected 2 distinct long-wait actors (one per concurrent task), found $wait_actor_count (names seen: [$wait_actor_names]; expected $expect_name_1 for tenant_1=$tenant_1 and $expect_name_2 for tenant_2=$tenant_2) -- the two tasks may be sharing one actor"; }
   log "  confirmed: 2 distinct long-wait actors, one per task"
 
   log "durability test 1/2: killing task $task_id_1's own long-wait actor mid-poll"
   # Each task gets its own randomly generated instance id, exposed via GetTask's Metadata, used to reconstruct the actor name.
   local wait_actor
   wait_actor="checkpointd-${tenant_1}-long-wait"
-  if run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null | jq -e --arg name "$wait_actor" '.actors[] | select(.metadata.name == $name)' >/dev/null 2>&1; then
-    run_kubectl_ate delete actor "$wait_actor" -a "$NS" --any-state || true
+  if run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null | jq -e --arg name "$wait_actor" '.actors[] | select(.metadata.name == $name)' >/dev/null 2>&1; then
+    run_kubectl_ate delete actor "$wait_actor" -a "$ATESPACE" --any-state || true
     log "  deleted actor $wait_actor"
   else
     log "  no currently-assigned actor $wait_actor found (caught it between polls); continuing"
@@ -115,9 +115,9 @@ subtest_long_poll() {
 
   log "polling for both tasks to complete"
   pollTaskState "$LONG_POLL_URL" "$task_id_1" "$tenant_1" TASK_STATE_COMPLETED \
-    || { dump_checkpointd_server_logs; fail "task $task_id_1 never reached TASK_STATE_COMPLETED (last response: $LAST_GET_OUT)"; }
+    || { dump_checkpointd_server_logs; dump_harness_worker_logs; run_kubectl_ate get actors -a "$ATESPACE" >&2 || true; fail "task $task_id_1 never reached TASK_STATE_COMPLETED (last response: $LAST_GET_OUT)"; }
   pollTaskState "$LONG_POLL_URL" "$task_id_2" "$tenant_2" TASK_STATE_COMPLETED \
-    || { dump_checkpointd_server_logs; fail "task $task_id_2 never reached TASK_STATE_COMPLETED (last response: $LAST_GET_OUT)"; }
+    || { dump_checkpointd_server_logs; dump_harness_worker_logs; run_kubectl_ate get actors -a "$ATESPACE" >&2 || true; fail "task $task_id_2 never reached TASK_STATE_COMPLETED (last response: $LAST_GET_OUT)"; }
   log "  both long-poll tasks completed, triggered entirely from outside the cluster"
 
   log "checking ListTasks against long-poll's own path reports both completed tasks"
