@@ -17,10 +17,8 @@ package substrate
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +47,6 @@ import (
 	"github.com/ktock/checkpointd/internal/ate"
 	"github.com/ktock/checkpointd/internal/harness"
 	"github.com/ktock/checkpointd/proto"
-	protolib "google.golang.org/protobuf/proto"
 )
 
 // Compile-time interface assertions.
@@ -69,8 +67,7 @@ var workerKeepaliveParams = keepalive.ClientParameters{
 	PermitWithoutStream: true,
 }
 
-// DefaultSuspendActorTimeout is the client-side timeout Checkpoint applies
-// to its SuspendActor call when New is not given an explicit override.
+// DefaultSuspendActorTimeout is the client-side SuspendActor timeout, kept one minute above Substrate's 10-minute maxRPCDeadline in cmd/ateapi/main.go.
 const DefaultSuspendActorTimeout = 11 * time.Minute
 
 // SubstrateHarness manages execution in a SubstrATE sandboxed actor over gRPC HarnessService.
@@ -88,6 +85,18 @@ type SubstrateHarness struct {
 	healthCheckTimeout time.Duration
 	tokenFile          string
 	routerAddr         string
+	// egressPolicy, when set, is given to every actor before it resumes, since Substrate denies all egress to an actor without one.
+	egressPolicy *ateapipb.EgressPolicy
+}
+
+// SetEgressPolicy makes every actor of this harness get policy before it resumes.
+func (h *SubstrateHarness) SetEgressPolicy(policy *ateapipb.EgressPolicy) {
+	h.egressPolicy = policy
+}
+
+// EgressPolicy returns the policy every actor of this harness gets, or nil if it has none.
+func (h *SubstrateHarness) EgressPolicy() *ateapipb.EgressPolicy {
+	return h.egressPolicy
 }
 
 func (h *SubstrateHarness) resolvedHealthCheckTimeout() time.Duration {
@@ -152,6 +161,15 @@ func New(harnessID string, endpoint string, namespace string, template string, p
 		tokenFile:           ctrlOpts.TokenFile,
 		routerAddr:          routerAddr,
 	}, nil
+}
+
+// NewTemplateLister returns a client that lists ActorTemplates from the Control API at endpoint, authenticated the same way as New's harnesses.
+func NewTemplateLister(endpoint string, ctrlOpts ControlAPIOptions) (*ate.TemplateLister, error) {
+	controlOpts, err := controlDialOptions(ctrlOpts)
+	if err != nil {
+		return nil, err
+	}
+	return ate.NewTemplateLister(endpoint, controlOpts...)
 }
 
 // controlKeepaliveParams is applied to the control-API connection.
@@ -237,21 +255,14 @@ func (c bearerTokenFileCreds) RequireTransportSecurity() bool { return true }
 // path real actor traffic takes.
 const defaultActorRouterAddr = "atenet-router.ate-system.svc:8081"
 
-// actorDNSSuffix is the fixed suffix of an actor's routable DNS name, which
-// atenet-router uses to resolve a CONNECT authority to a specific actor:
-// "<name>.<atespace>.actors.resources.substrate.ate.dev".
-const actorDNSSuffix = "actors.resources.substrate.ate.dev"
+// targetActorHeader names the actor atenet-router routes a CONNECT request to, as "<atespace>/<actor>".
+const targetActorHeader = "ate-target-actor"
 
-// actorDNSName returns the DNS name atenet-router routes on for the actor
-// named name in atespace.
-func actorDNSName(atespace, name string) string {
-	return name + "." + atespace + "." + actorDNSSuffix
-}
-
-// dialThroughRouter opens a plaintext connection to authority (an actor's DNS
-// name plus port) by CONNECT-tunneling through atenet-router, since a worker
-// pod is not reachable directly (see defaultActorRouterAddr).
-func dialThroughRouter(ctx context.Context, routerAddr, authority string) (net.Conn, error) {
+// dialThroughRouter opens a plaintext connection to the given port of the actor named name in atespace by
+// CONNECT-tunneling through atenet-router, since a worker pod is not reachable directly (see defaultActorRouterAddr).
+func dialThroughRouter(ctx context.Context, routerAddr, atespace, name, port string) (net.Conn, error) {
+	// The router routes on the target-actor header and takes only the port from the authority.
+	authority := net.JoinHostPort(name+"."+atespace, port)
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", routerAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dialing atenet-router at %s: %w", routerAddr, err)
@@ -260,6 +271,7 @@ func dialThroughRouter(ctx context.Context, routerAddr, authority string) (net.C
 		Method: http.MethodConnect,
 		URL:    &url.URL{Host: authority},
 		Host:   authority,
+		Header: http.Header{targetActorHeader: {atespace + "/" + name}},
 	}
 	if err := req.Write(conn); err != nil {
 		conn.Close()
@@ -298,11 +310,6 @@ func (h *SubstrateHarness) DeleteActor(ctx context.Context, conversationID strin
 	return h.ateClient.DeleteActor(ctx, conversationID)
 }
 
-// DeleteCrashRecoveryTag deletes conversationID's ActorSnapshotTag.
-func (h *SubstrateHarness) DeleteCrashRecoveryTag(ctx context.Context, conversationID string) error {
-	return h.ateClient.DeleteActorSnapshotTag(ctx, crashRecoveryTagName(conversationID))
-}
-
 // resumeActor ensures conversationID's actor is running with an assigned
 // worker, declaratively driven by whatever state GetActor reports.
 func (h *SubstrateHarness) resumeActor(ctx context.Context, conversationID string) (*ateapipb.Actor, error) {
@@ -311,23 +318,8 @@ func (h *SubstrateHarness) resumeActor(ctx context.Context, conversationID strin
 		if status.Code(err) != codes.NotFound {
 			return nil, fmt.Errorf("failed to look up actor %s: %w", conversationID, err)
 		}
-		tagName := crashRecoveryTagName(conversationID)
-		if _, tagErr := h.ateClient.GetActorSnapshotTag(ctx, tagName); tagErr != nil {
-			if status.Code(tagErr) != codes.NotFound {
-				return nil, fmt.Errorf("failed to check %s for a leftover crash-recovery tag: %w", conversationID, tagErr)
-			}
-			// The ordinary case: a genuinely new conversation.
-			if _, err := h.ateClient.CreateActor(ctx, conversationID); err != nil && status.Code(err) != codes.AlreadyExists {
-				return nil, fmt.Errorf("failed to create substrate actor %s: %w", conversationID, err)
-			}
-		} else {
-			// Not found, a crash-recovery tag exists. A prior recovery attempt
-			// crashed before completion.
-			slog.WarnContext(ctx, "crash recovery: found a leftover recovery tag for an actor that doesn't exist -- a prior recovery was interrupted after deleting the crashed actor but before recreating it from its own snapshot; finishing recovery from the tag",
-				slog.String("conversation_id", conversationID), slog.String("tag", tagName))
-			if err := h.finishRecoveryFromTag(ctx, conversationID, tagName); err != nil {
-				return nil, err
-			}
+		if _, err := h.ateClient.CreateActor(ctx, conversationID); err != nil && status.Code(err) != codes.AlreadyExists {
+			return nil, fmt.Errorf("failed to create substrate actor %s: %w", conversationID, err)
 		}
 		return h.doResumeActor(ctx, conversationID)
 	}
@@ -336,55 +328,47 @@ func (h *SubstrateHarness) resumeActor(ctx context.Context, conversationID strin
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ateapipb.ActorState_ACTOR_STATE_RUNNING:
 		// Already resumable as-is.
 	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
-		// Substrate's own ResumeActor workflow is designed to be safely
-		// re-entered for an actor already RESUMING: it revalidates the
-		// existing worker assignment and either continues the resume to
-		// completion or crashes the actor if that worker is gone, handled
-		// as CRASHED on a later retry. It never resolves this on its own,
-		// so retry ResumeActor directly instead of declining below.
-	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-		// Recover from its own last completed checkpoint, then ResumeActor
-		slog.WarnContext(ctx, "crash recovery: actor CRASHED; recovering from its own last completed checkpoint",
+		// Substrate's ResumeActor is safe to re-enter, so retry it directly.
+	case ateapipb.ActorState_ACTOR_STATE_CRASHED, ateapipb.ActorState_ACTOR_STATE_REVERTING:
+		// An interrupted revert is re-entered the same way as a fresh one.
+		slog.WarnContext(ctx, "crash recovery: actor CRASHED; reverting it to its own last completed checkpoint",
 			slog.String("conversation_id", conversationID),
 			slog.Int64("actor_version", actor.GetMetadata().GetVersion()),
-			slog.String("latest_snapshot", actor.GetStatus().GetLatestSnapshot().GetName()))
-		if err := h.discardAndRecoverFromSnapshot(ctx, conversationID, actor); err != nil {
-			return nil, err
-		}
-	case ateapipb.ActorState_ACTOR_STATE_DELETING:
-		// Release the worker assignment if the actor still holds one,
-		// recover from its own last completed checkpoint, then ResumeActor
-		if worker := actor.GetStatus().GetWorkerAssignment().GetWorker(); worker != nil {
-			slog.WarnContext(ctx, "crash recovery: actor stuck DELETING still holds a worker assignment; releasing it directly (bypassing that worker's own atelet) before retrying delete",
-				slog.String("conversation_id", conversationID), slog.String("worker", worker.GetName()))
-			if err := h.ateClient.DeleteWorker(ctx, worker); err != nil {
-				return nil, fmt.Errorf("failed to release actor %s from its stuck worker %s: %w", conversationID, worker.GetName(), err)
-			}
-		}
-		if err := h.discardAndRecoverFromSnapshot(ctx, conversationID, actor); err != nil {
+			slog.String("external_snapshot", actor.GetStatus().GetExternalSnapshot().GetSnapshotUri()))
+		if err := h.revertActor(ctx, conversationID); err != nil {
 			return nil, err
 		}
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
-		// SuspendActor's own workflow is designed to be safely re-entered,
-		// so retrying it here usually either lets an in-progress
-		// checkpoint finish or discovers the sandbox is genuinely wedged
-		// and crashes the actor, handled as CRASHED on a later retry.
+		// Substrate's SuspendActor is safe to re-enter, so retry it before giving up.
 		if _, err := h.ateClient.SuspendActor(ctx, conversationID); err != nil {
 			if status.Code(err) == codes.Aborted {
-				// The original SuspendActor call may still be legitimately
-				// in flight (holding the actor's lease) or have just
-				// landed a concurrent write, not stuck. Recovering from a
-				// snapshot here would roll the actor back past state that
-				// call may still go on to commit, so report this as
-				// retryable instead.
-				return nil, fmt.Errorf("actor %s's own suspend is still genuinely in progress (%s); not recovering from a snapshot while it might still complete: %w", conversationID, err.Error(), err)
+				// Reverting now could roll back state that the still-running original suspend may commit.
+				return nil, fmt.Errorf("actor %s's own suspend is still genuinely in progress (%s); not reverting it while it might still complete: %w", conversationID, err.Error(), err)
 			}
-			slog.WarnContext(ctx, "crash recovery: actor stuck SUSPENDING could not be re-suspended either; recovering from its own last completed checkpoint instead",
+			if actor.GetStatus().GetWorkerAssignment().GetWorker() == nil {
+				// RevertActor rejects SUSPENDING and there is no worker whose release would crash the actor into a revertable state.
+				return nil, fmt.Errorf("actor %s is stuck SUSPENDING without a worker to release, which Substrate cannot revert; retrying the suspend: %w", conversationID, err)
+			}
+			slog.WarnContext(ctx, "crash recovery: actor stuck SUSPENDING could not be re-suspended either; reverting it to its own last completed checkpoint instead",
 				slog.String("conversation_id", conversationID), slog.Any("error", err))
-			if err := h.discardAndRecoverFromSnapshot(ctx, conversationID, actor); err != nil {
+			if err := h.releaseWorker(ctx, conversationID, actor); err != nil {
+				return nil, err
+			}
+			if err := h.revertActor(ctx, conversationID); err != nil {
 				return nil, err
 			}
 		}
+	case ateapipb.ActorState_ACTOR_STATE_DELETING:
+		// Substrate's DeleteActor releases the actor's snapshots even when its terminate step fails, so a DELETING actor cannot be recovered and its deletion is finished instead.
+		slog.WarnContext(ctx, "actor is DELETING because an earlier delete of it never finished; finishing that delete so the next attempt starts from a fresh actor",
+			slog.String("conversation_id", conversationID))
+		if err := h.releaseWorker(ctx, conversationID, actor); err != nil {
+			return nil, err
+		}
+		if err := h.ateClient.DeleteActor(ctx, conversationID); err != nil {
+			return nil, fmt.Errorf("failed to finish deleting actor %s: %w", conversationID, err)
+		}
+		return nil, fmt.Errorf("actor %s was being deleted and its deletion is now finished; retry to start from a fresh actor", conversationID)
 	default:
 		// Transient state expected to resolve on its own.
 		return nil, fmt.Errorf("actor %s is in state %s, neither resumable nor a recognized stuck state; declining to recover it. Retry later.",
@@ -393,9 +377,32 @@ func (h *SubstrateHarness) resumeActor(ctx context.Context, conversationID strin
 	return h.doResumeActor(ctx, conversationID)
 }
 
+// releaseWorker deletes the worker hosting actor, which is the only way to force an actor with an unreachable worker into CRASHED.
+func (h *SubstrateHarness) releaseWorker(ctx context.Context, conversationID string, actor *ateapipb.Actor) error {
+	worker := actor.GetStatus().GetWorkerAssignment().GetWorker()
+	if worker == nil {
+		return nil
+	}
+	if err := h.ateClient.DeleteWorker(ctx, worker); err != nil {
+		return fmt.Errorf("failed to release actor %s from its worker %s: %w", conversationID, worker.GetName(), err)
+	}
+	return nil
+}
+
+// revertActor returns conversationID's actor to SUSPENDED at its last completed snapshot, ready for ResumeActor.
+func (h *SubstrateHarness) revertActor(ctx context.Context, conversationID string) error {
+	if _, err := h.ateClient.RevertActor(ctx, conversationID); err != nil {
+		return fmt.Errorf("failed to revert actor %s to its own last snapshot: %w", conversationID, err)
+	}
+	return nil
+}
+
 // doResumeActor calls ResumeActor for conversationID and returns the
 // resulting actor.
 func (h *SubstrateHarness) doResumeActor(ctx context.Context, conversationID string) (*ateapipb.Actor, error) {
+	if err := h.ensureEgressPolicy(ctx, conversationID); err != nil {
+		return nil, err
+	}
 	resumeResp, err := h.ateClient.ResumeActor(ctx, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resume substrate actor %s: %w", conversationID, err)
@@ -405,6 +412,18 @@ func (h *SubstrateHarness) doResumeActor(ctx context.Context, conversationID str
 		return nil, fmt.Errorf("received nil actor in response for %s", conversationID)
 	}
 	return actor, nil
+}
+
+// ensureEgressPolicy gives conversationID's actor the configured egress policy, which is a no-op if it already has one.
+// It runs before every resume so an actor whose first attempt failed after creation still ends up with its policy.
+func (h *SubstrateHarness) ensureEgressPolicy(ctx context.Context, conversationID string) error {
+	if h.egressPolicy == nil {
+		return nil
+	}
+	if err := h.ateClient.CreateActorEgressPolicy(ctx, conversationID, h.egressPolicy); err != nil && status.Code(err) != codes.AlreadyExists {
+		return fmt.Errorf("failed to give actor %s its egress policy: %w", conversationID, err)
+	}
+	return nil
 }
 
 // dialAndWaitHealthy dials actor's assigned worker's HarnessService.
@@ -419,10 +438,10 @@ func (h *SubstrateHarness) dialAndWaitHealthy(ctx context.Context, conversationI
 	dialOpts := h.dialOpts
 	viaRouter := ""
 	if tokenFileReadable(h.tokenFile) {
-		dialTarget = fmt.Sprintf("%s:%d", actorDNSName(h.namespace, conversationID), h.port)
+		dialTarget = fmt.Sprintf("%s.%s:%d", conversationID, h.namespace, h.port)
 		dialOpts = append([]grpc.DialOption{
-			grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-				return dialThroughRouter(ctx, h.routerAddr, addr)
+			grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+				return dialThroughRouter(ctx, h.routerAddr, h.namespace, conversationID, strconv.Itoa(h.port))
 			}),
 		}, h.dialOpts...)
 		viaRouter = fmt.Sprintf(" (via atenet-router %s)", h.routerAddr)
@@ -463,7 +482,7 @@ func (h *SubstrateHarness) Start(ctx context.Context, conversationID string, con
 				slog.String("conversation_id", conversationID),
 				slog.String("worker", worker.GetName()),
 				slog.Int64("actor_version", actor.GetMetadata().GetVersion()),
-				slog.String("latest_snapshot", actor.GetStatus().GetLatestSnapshot().GetName()))
+				slog.String("external_snapshot", actor.GetStatus().GetExternalSnapshot().GetSnapshotUri()))
 			if delErr := h.ateClient.DeleteWorker(ctx, worker); delErr != nil {
 				return nil, fmt.Errorf("%w (also failed to release its unreachable worker %s: %v)", err, worker.GetName(), delErr)
 			}
@@ -479,7 +498,7 @@ func (h *SubstrateHarness) Start(ctx context.Context, conversationID string, con
 		client:                proto.NewHarnessServiceClient(conn),
 		config:                config,
 		suspendActorTimeout:   h.resolvedSuspendActorTimeout(),
-		preCheckpointSnapshot: actor.GetStatus().GetLatestSnapshot().GetName(),
+		preCheckpointSnapshot: actor.GetStatus().GetExternalSnapshot().GetSnapshotUri(),
 	}, nil
 }
 
@@ -488,88 +507,6 @@ func (h *SubstrateHarness) resolvedSuspendActorTimeout() time.Duration {
 		return DefaultSuspendActorTimeout
 	}
 	return h.suspendActorTimeout
-}
-
-// crashRecoveryTagName derives a deterministic ActorSnapshotTag name from
-// conversationID.
-func crashRecoveryTagName(conversationID string) string {
-	sum := sha256.Sum256([]byte(conversationID))
-	// encode 32bytes digest to string using base32 so get
-	// a shorter string representation (5bits per char so 52
-	// chars w/o padding). So it fit in 63 chars label limit.
-	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
-	return "crash-" + strings.ToLower(enc.EncodeToString(sum[:]))
-}
-
-// discardAndRecoverFromSnapshot recovers conversationID's actor being
-// unrecoverable (CRASHED, or stuck DELETING/SUSPENDING). It reads the
-// actor's own LatestSnapshot, pins it under a durable tag, deletes the
-// actor record, and recreates it from that tag, which comes back SUSPENDED
-// at its last completed hop.
-func (h *SubstrateHarness) discardAndRecoverFromSnapshot(ctx context.Context, conversationID string, actor *ateapipb.Actor) error {
-	tagName := crashRecoveryTagName(conversationID)
-
-	snapshot := actor.GetStatus().GetLatestSnapshot()
-	if snapshot == nil {
-		// No checkpoint was ever completed for this actor, so there's
-		// nothing to preserve; deleting and recreating it blank is safe,
-		// since the caller's retry redelivers this conversation's
-		// bootstrap input anyway.
-		if err := h.ateClient.DeleteActor(ctx, conversationID); err != nil {
-			return fmt.Errorf("failed to delete crashed actor %s (no prior snapshot to recover from): %w", conversationID, err)
-		}
-		if _, err := h.ateClient.CreateActor(ctx, conversationID); err != nil && status.Code(err) != codes.AlreadyExists {
-			return fmt.Errorf("failed to recreate actor %s blank after a crash with no prior snapshot: %w", conversationID, err)
-		}
-		return nil
-	}
-	if err := h.ensureSnapshotTag(ctx, conversationID, tagName, snapshot); err != nil {
-		return err
-	}
-	if err := h.ateClient.DeleteActor(ctx, conversationID); err != nil {
-		return fmt.Errorf("failed to delete crashed actor %s: %w", conversationID, err)
-	}
-	return h.finishRecoveryFromTag(ctx, conversationID, tagName)
-}
-
-// finishRecoveryFromTag recreates conversationID's actor from tagName.
-func (h *SubstrateHarness) finishRecoveryFromTag(ctx context.Context, conversationID, tagName string) error {
-	if _, err := h.ateClient.CreateActorFromSnapshotTag(ctx, conversationID, tagName); err != nil && status.Code(err) != codes.AlreadyExists {
-		return fmt.Errorf("failed to recreate actor %s from its own last snapshot: %w", conversationID, err)
-	}
-	if err := h.ateClient.DeleteActorSnapshotTag(ctx, tagName); err != nil {
-		// Best-effort: the new actor already has its own copy of the
-		// snapshot reference, so a leaked tag only costs tidiness. A later
-		// cleanup pass makes another attempt once the task completes.
-		slog.WarnContext(ctx, "crash recovery: failed to clean up snapshot tag",
-			slog.String("conversation_id", conversationID), slog.String("tag", tagName), slog.Any("error", err))
-	}
-	return nil
-}
-
-// ensureSnapshotTag creates tagName pointing at snapshot, tolerating a stale
-// tag under this same deterministic name.
-func (h *SubstrateHarness) ensureSnapshotTag(ctx context.Context, conversationID, tagName string, snapshot *ateapipb.ObjectRef) error {
-	if _, err := h.ateClient.CreateActorSnapshotTag(ctx, tagName, snapshot); err != nil {
-		if status.Code(err) != codes.AlreadyExists {
-			return fmt.Errorf("failed to tag crashed actor %s's own last snapshot: %w", conversationID, err)
-		}
-		existing, getErr := h.ateClient.GetActorSnapshotTag(ctx, tagName)
-		if getErr != nil {
-			return fmt.Errorf("failed to check existing snapshot tag %s for crashed actor %s: %w", tagName, conversationID, getErr)
-		}
-		if !protolib.Equal(existing.GetSnapshot(), snapshot) {
-			slog.WarnContext(ctx, "crash recovery: found a stale snapshot tag left over from an earlier crash of this actor, repointing it at the current crash's own snapshot",
-				slog.String("conversation_id", conversationID), slog.String("tag", tagName))
-			if err := h.ateClient.DeleteActorSnapshotTag(ctx, tagName); err != nil {
-				return fmt.Errorf("failed to discard stale snapshot tag %s for crashed actor %s: %w", tagName, conversationID, err)
-			}
-			if _, err := h.ateClient.CreateActorSnapshotTag(ctx, tagName, snapshot); err != nil {
-				return fmt.Errorf("failed to re-tag crashed actor %s's own last snapshot after discarding a stale tag: %w", conversationID, err)
-			}
-		}
-	}
-	return nil
 }
 
 // waitForHealthy blocks until the harness behind conn reports SERVING via the
@@ -625,7 +562,7 @@ type substrateExecution struct {
 	config              []byte
 	suspendActorTimeout time.Duration
 
-	// preCheckpointSnapshot is this actor's own LatestSnapshot name before
+	// preCheckpointSnapshot is this actor's own external snapshot URI before
 	// this turn ran.
 	preCheckpointSnapshot string
 
@@ -724,14 +661,14 @@ func (e *substrateExecution) Checkpoint(ctx context.Context) error {
 	// this turn's progress was silently not recorded (e.g. because of worker
 	// crash). Returning an error here keeps the turn uncommitted (PENDING),
 	// so the caller's retry loop re-attempts the whole turn from a fresh Start.
-	got := resp.GetActor().GetStatus().GetLatestSnapshot().GetName()
+	got := resp.GetActor().GetStatus().GetExternalSnapshot().GetSnapshotUri()
 	if got == "" || got == e.preCheckpointSnapshot {
-		slog.WarnContext(ctx, "SuspendActor reported success but this actor's own LatestSnapshot did not advance -- treating as a checkpoint failure",
+		slog.WarnContext(ctx, "SuspendActor reported success but this actor's own external snapshot did not advance -- treating as a checkpoint failure",
 			slog.String("conversation_id", e.conversationID),
 			slog.String("exec_id", e.execID),
 			slog.String("pre_checkpoint_snapshot", e.preCheckpointSnapshot),
 			slog.String("post_checkpoint_snapshot", got))
-		return fmt.Errorf("SuspendActor for substrate actor %s reported success but its own LatestSnapshot did not advance (still %q): this turn's own state was not actually recorded durably", e.conversationID, got)
+		return fmt.Errorf("SuspendActor for substrate actor %s reported success but its own external snapshot did not advance (still %q): this turn's own state was not actually recorded durably", e.conversationID, got)
 	}
 	return nil
 }

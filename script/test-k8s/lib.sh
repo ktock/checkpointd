@@ -49,6 +49,12 @@ dump_checkpointd_server_logs() {
   run_kubectl -n "$NS" logs pod/checkpointd-server-0 2>&1 | sed 's/^/[checkpointd-server] /' >&2 || true
 }
 
+# dump_egress_denials prints what the egress gateway denied, since an outbound call an agent was refused shows up only there.
+dump_egress_denials() {
+  log "--- atenet-egress denials ---"
+  run_kubectl -n ate-system logs deployment/atenet-egress --all-containers 2>&1 | grep -a "egress denied" | tail -20 | sed 's/^/[atenet-egress] /' >&2 || true
+}
+
 # dumpAllCheckpointdServerLogs prints every checkpointd-server replica's own
 # logs.
 dumpAllCheckpointdServerLogs() {
@@ -57,20 +63,6 @@ dumpAllCheckpointdServerLogs() {
   for pod in $(run_kubectl -n "$NS" get pods -l app=checkpointd-server -o name 2>/dev/null); do
     run_kubectl -n "$NS" logs "$pod" 2>&1 | sed "s/^/[${pod#pod/}] /" >&2 || true
   done
-}
-
-# countRelaysToAcrossPods is countRelaysTo generalized across every
-# checkpointd-server replica's own current logs.
-countRelaysToAcrossPods() {
-  local targetActorID=$1 pod total=0 n
-  for pod in $(run_kubectl -n "$NS" get pods -l app=checkpointd-server -o name 2>/dev/null); do
-    n="$(run_kubectl -n "$NS" logs "$pod" 2>/dev/null \
-      | jq -R -r --arg id "$targetActorID" \
-          'fromjson? | select(.msg == "Suspending SubstrATE actor" and .conversation_id == $id) | .conversation_id' \
-      | wc -l | tr -d ' ')"
-    total=$((total + n))
-  done
-  echo "$total"
 }
 
 # dump_testserver_diagnostics prints testserver's pod status and logs.
@@ -256,7 +248,7 @@ resolveWorkerPod() {
     session_id="$(echo "$task_out" | jq -r '.metadata["checkpointd-tenant"] // empty' 2>/dev/null)"
     if [[ -n "$session_id" ]]; then
       actor_name="$(actorName "$session_id" "$agent")"
-      a="$(run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null | jq -c --arg name "$actor_name" '[.actors[] | select(.metadata.name == $name)] | .[0] // empty' 2>/dev/null)"
+      a="$(run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null | jq -c --arg name "$actor_name" '[.actors[] | select(.metadata.name == $name)] | .[0] // empty' 2>/dev/null)"
       if [[ -n "$a" && "$a" != "empty" && "$a" != "null" ]]; then
         worker_ns="$(echo "$a" | jq -r '.status.workerAssignment.workerNamespace // empty')"
         worker_pod="$(echo "$a" | jq -r '.status.workerAssignment.workerPod // empty')"
@@ -295,38 +287,31 @@ checkEnteredOnce() {
     || fail "$label: its own workflow was entered $count times (want exactly 1) -- recovery discarded the actor's healthy in-flight state and restarted it from a blank snapshot instead of resuming"
 }
 
-# countRelaysTo counts how many turns checkpointd dispatched to targetActorID,
-# via its own per-turn "Suspending SubstrATE actor" JSON log line.
+# countRelaysTo counts the "Suspending SubstrATE actor" log lines for targetActorID across all current checkpointd-server replicas, only those after the optional Unix time with fractional seconds.
 countRelaysTo() {
-  local targetActorID=$1
-  run_kubectl -n "$NS" logs pod/checkpointd-server-0 2>/dev/null \
-    | jq -R -r --arg id "$targetActorID" \
-        'fromjson? | select(.msg == "Suspending SubstrATE actor" and .conversation_id == $id) | .conversation_id' \
-    | wc -l | tr -d ' '
+  local targetActorID=$1 since=${2:-0} pod total=0 n
+  for pod in $(run_kubectl -n "$NS" get pods -l app=checkpointd-server -o name 2>/dev/null); do
+    n="$(run_kubectl -n "$NS" logs "$pod" 2>/dev/null \
+      | jq -R -r --arg id "$targetActorID" --argjson since "$since" '
+          fromjson? | select(.msg == "Suspending SubstrATE actor" and .conversation_id == $id)
+          | (.time | capture("^(?<s>[^.Z]+)(?<f>\\.[0-9]+)?Z$")) as $t
+          | select((($t.s + "Z") | fromdateiso8601) + (("0" + ($t.f // "")) | tonumber) > $since)
+          | .conversation_id' \
+      | wc -l | tr -d ' ')"
+    total=$((total + n))
+  done
+  echo "$total"
 }
 
-# checkCallNotRepeated asserts checkpointd dispatched exactly want turns to one private actor.
+# checkCallNotRepeated asserts checkpointd dispatched exactly want turns to one private actor, counting only those after the optional Unix time with fractional seconds.
 checkCallNotRepeated() {
-  local tenant=$1 target=$2 want=$3 label=$4
+  local tenant=$1 target=$2 want=$3 label=$4 since=${5:-0}
   local targetActorID
   targetActorID="$(actorName "$tenant" "$target")"
   local count
-  count="$(countRelaysTo "$targetActorID")"
+  count="$(countRelaysTo "$targetActorID" "$since")"
   [[ "$count" == "$want" ]] \
-    || fail "$label: checkpointd dispatched $count turns to $targetActorID (want exactly $want) -- recovery redid an already-completed hop instead of resuming past it"
-}
-
-# checkCallNotRepeatedAcrossPods is checkCallNotRepeated generalized across
-# every checkpointd-server replica's own current logs -- unreliable for a
-# replica whose pod (and thus its logs) has since been removed.
-checkCallNotRepeatedAcrossPods() {
-  local tenant=$1 target=$2 want=$3 label=$4
-  local targetActorID
-  targetActorID="$(actorName "$tenant" "$target")"
-  local count
-  count="$(countRelaysToAcrossPods "$targetActorID")"
-  [[ "$count" == "$want" ]] \
-    || fail "$label: checkpointd dispatched $count turns to $targetActorID across all current replicas (want exactly $want) -- recovery redid an already-completed hop, or double-drove it from two instances at once, instead of resuming past it"
+    || { dumpAllCheckpointdServerLogs; fail "$label: checkpointd dispatched $count turns to $targetActorID across all current replicas (want exactly $want) -- recovery redid an already-completed hop, or double-drove it from two instances at once, instead of resuming past it"; }
 }
 
 # portForwardToPod starts a short-lived port-forward directly to one pod,

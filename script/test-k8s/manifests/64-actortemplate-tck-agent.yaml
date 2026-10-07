@@ -13,28 +13,42 @@
 # limitations under the License.
 
 # ActorTemplate for tck_agent, the A2A TCK conformance-test scenario agent, exposed at /agents/tck-agent/.
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
 metadata:
+  atespace: ${ATESPACE}
   name: tck-agent-template
-  namespace: ${NS}
-spec:
-  workerSelector:
-    matchLabels:
-      workload: ${NS}-harness
-  containers:
-    - name: tck-agent
-      image: "${TCK_AGENT_IMAGE}"
-      command: ["/app/tck-agent", "--harness-addr", "0.0.0.0:80"]
-      env:
-        - name: CHECKPOINTD_AGENT
-          value: "true"
-        - name: CHECKPOINTD_AGENT_ID
-          value: tck-agent
-        - name: CHECKPOINTD_AGENT_CARD
-          value: |
-            name: A2A TCK Conformance Agent
-            description: Routes on each message's own messageId prefix (tck-input-required, tck-complete-task, tck-reject-task, ...), matching the A2A TCK's own reference SUT -- see script/test-k8s/agents/tck_agent
-            version: 1.0.0
-  snapshotsConfig:
-    location: "gs://ate-snapshots/${NS}/tck-agent/"
+workerSelector:
+  matchLabels:
+    workload: ${NS}-harness
+containers:
+  - name: tck-agent
+    image: "${TCK_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command: ["/app/tck-agent", "--harness-addr", "0.0.0.0:80"]
+    env:
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: tck-agent
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: A2A TCK Conformance Agent
+          description: Routes on each message's own messageId prefix (tck-input-required, tck-complete-task, tck-reject-task, ...), matching the A2A TCK's own reference SUT -- see script/test-k8s/agents/tck_agent
+          version: 1.0.0
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/${NS}/tck-agent/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

@@ -13,40 +13,62 @@
 # limitations under the License.
 
 # ActorTemplate for chat-agent, built by agents.Dockerfile's `chat-agent` target.
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
 metadata:
+  atespace: checkpointd-llm-chat-demo
   name: chat-agent-template
-  namespace: checkpointd-llm-chat-demo
-spec:
-  workerSelector:
-    matchLabels:
-      workload: checkpointd-llm-chat-demo-harness
-  containers:
-    - name: chat-agent
-      image: "${CHAT_AGENT_IMAGE}"
-      command:
-        - /app/chat-agent
-        - --harness-addr
-        - 0.0.0.0:80
-        - --checkpointd-addr # resolves reviewer-agent's AgentCard
-        - checkpointd-server.checkpointd-llm-chat-demo.svc:80
-        - --llama-addr # in-cluster llama-completion Service
-        - llama-completion.checkpointd-llm-chat-demo.svc:8080
-      env:
-        - name: CHECKPOINTD_AGENT
-          value: "true"
-        - name: CHECKPOINTD_AGENT_ID
-          value: chat-agent
-        - name: CHECKPOINTD_AGENT_CARD
-          value: |
-            name: Chat Agent
-            description: >-
-              Stateful chat agent backed by a local llama.cpp completion
-              server -- answers the user, asks reviewer-agent for a
-              second opinion, and remembers the whole conversation across
-              turns and crashes. See examples/llm-chat-demo
-            version: 1.0.0
-  # onPause/onCommit default to "Full" process-memory snapshots, letting chat-agent's conversation var survive a checkpoint/resume unaided.
-  snapshotsConfig:
-    location: "gs://ate-snapshots/checkpointd-llm-chat-demo/chat-agent/"
+workerSelector:
+  matchLabels:
+    workload: checkpointd-llm-chat-demo-harness
+containers:
+  - name: chat-agent
+    image: "${CHAT_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command:
+      - /app/chat-agent
+      - --harness-addr
+      - 0.0.0.0:80
+      - --checkpointd-addr # resolves reviewer-agent's AgentCard
+      - checkpointd-server.checkpointd-llm-chat-demo.svc:80
+      - --llama-addr # in-cluster llama-completion Service
+      - llama-completion.checkpointd-llm-chat-demo.svc:8080
+    env:
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: chat-agent
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Chat Agent
+          description: >-
+            Stateful chat agent backed by a local llama.cpp completion
+            server -- answers the user, asks reviewer-agent for a
+            second opinion, and remembers the whole conversation across
+            turns and crashes. See examples/llm-chat-demo
+          version: 1.0.0
+      # Substrate denies all egress to an actor without a policy, so this lists what the agent calls.
+      - name: CHECKPOINTD_EGRESS_POLICY
+        value: |
+          rules:
+            - hostnames:
+                patterns: ["checkpointd-server.checkpointd-llm-chat-demo.svc"]
+            - hostnames:
+                patterns: ["llama-completion.checkpointd-llm-chat-demo.svc"]
+# FULL snapshot scope captures process memory, letting chat-agent's conversation var survive a checkpoint/resume unaided.
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/checkpointd-llm-chat-demo/chat-agent/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

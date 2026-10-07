@@ -13,36 +13,56 @@
 # limitations under the License.
 
 # "long-wait": polls testserver once per turn and always replies immediately, leaving the retry loop to long-poll.
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
 metadata:
+  atespace: ${ATESPACE}
   name: long-wait-template
-  namespace: ${NS}
-spec:
-  workerSelector:
-    matchLabels:
-      workload: ${NS}-harness
-  containers:
-    - name: long-wait
-      image: "${LONG_WAIT_IMAGE}"
-      command:
-        - /app/long-wait
-        - --harness-addr
-        - 0.0.0.0:80
-        - --testserver-addr
-        - testserver.${NS}.svc:8080
-        - --poll-timeout
-        # Must stay comfortably under atenet-router's own per-request timeout.
-        - 5s
-      env:
-        - name: CHECKPOINTD_AGENT
-          value: "true"
-        - name: CHECKPOINTD_AGENT_ID
-          value: long-wait
-        - name: CHECKPOINTD_AGENT_CARD
-          value: |
-            name: Long Wait
-            description: Polls script/test-k8s/agents/testserver once per turn and replies immediately -- the payload if notified, or a not-yet signal otherwise
-            version: 1.0.0
-  snapshotsConfig:
-    location: "gs://ate-snapshots/${NS}/long-wait/"
+workerSelector:
+  matchLabels:
+    workload: ${NS}-harness
+containers:
+  - name: long-wait
+    image: "${LONG_WAIT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command:
+      - /app/long-wait
+      - --harness-addr
+      - 0.0.0.0:80
+      - --testserver-addr
+      - testserver.${NS}.svc:8080
+      - --poll-timeout
+      # Must stay comfortably under atenet-router's own per-request timeout.
+      - 5s
+    env:
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: long-wait
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Long Wait
+          description: Polls script/test-k8s/agents/testserver once per turn and replies immediately -- the payload if notified, or a not-yet signal otherwise
+          version: 1.0.0
+      # Substrate denies all egress to an actor without a policy, so this lists what the agent calls.
+      - name: CHECKPOINTD_EGRESS_POLICY
+        value: |
+          rules:
+            - hostnames:
+                patterns: ["testserver.${NS}.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/${NS}/long-wait/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

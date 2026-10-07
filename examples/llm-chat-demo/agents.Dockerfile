@@ -20,7 +20,7 @@
 #   docker build --target chat-agent -f examples/llm-chat-demo/agents.Dockerfile -t <ref> . && docker push <ref>
 #   docker build --target reviewer-agent -f examples/llm-chat-demo/agents.Dockerfile -t <ref> . && docker push <ref>
 
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src

@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"iter"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -2227,5 +2229,51 @@ func TestAgentHarness_TaskStatePreservedAcrossMultipleTurns(t *testing.T) {
 	}
 	if got, want := text(res3.msg.Data.Task.Status.Message), "done: prior state was "+string(a2a.TaskStateInputRequired); got != want {
 		t.Errorf("turn 3 reply message = %q, want %q -- StoredTask.Status.State from turn 2 was not seen on turn 3", got, want)
+	}
+}
+
+// actorNameTestRuntime returns an echo harness that reads its actor name from a file holding name, or from no file at all if name is empty.
+func actorNameTestRuntime(t *testing.T, name string) proto.HarnessServiceClient {
+	t.Helper()
+	rt := newActorRuntime(func(cc *callContext, current *a2a.Message, history storedHistory) (*hop.Data, error) {
+		return &hop.Data{Message: a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("ok")), Type: hop.DataTypeMessage}, nil
+	})
+	rt.actorNameFile = filepath.Join(t.TempDir(), "actor-name")
+	if name != "" {
+		if err := os.WriteFile(rt.actorNameFile, []byte(name+"\n"), 0o644); err != nil {
+			t.Fatalf("writing actor name file: %v", err)
+		}
+	}
+	return startTestHarness(t, rt)
+}
+
+func TestAgentHarness_TurnForAnotherActorIsRejected(t *testing.T) {
+	client := actorNameTestRuntime(t, "actor-a")
+
+	res := sendTurn(t, context.Background(), client, "actor-b", "agent", envNew(a2a.MessageRoleUser, "", "agent", "hi"))
+	err := res.err
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("turn error = %v, want code FailedPrecondition", err)
+	}
+	if !strings.Contains(err.Error(), "actor-b") || !strings.Contains(err.Error(), "actor-a") {
+		t.Fatalf("error %q should name both actors", err)
+	}
+}
+
+func TestAgentHarness_TurnForThisActorIsAccepted(t *testing.T) {
+	client := actorNameTestRuntime(t, "actor-a")
+
+	res := sendTurn(t, context.Background(), client, "actor-a", "agent", envNew(a2a.MessageRoleUser, "", "agent", "hi"))
+	if res.err != nil {
+		t.Fatalf("turn for this actor failed: %v", res.err)
+	}
+}
+
+func TestAgentHarness_TurnIsAcceptedWithoutActorNameFile(t *testing.T) {
+	client := actorNameTestRuntime(t, "")
+
+	res := sendTurn(t, context.Background(), client, "actor-b", "agent", envNew(a2a.MessageRoleUser, "", "agent", "hi"))
+	if res.err != nil {
+		t.Fatalf("turn failed without an actor name file: %v", res.err)
 	}
 }

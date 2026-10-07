@@ -8,19 +8,23 @@ Run every command below from the root of this (checkpointd) repo checkout, unles
 
 Refer to the [Agent Substrate](https://github.com/agent-substrate/substrate) repo for official setup procedure.
 
-As of `d909d690532b`, the KinD cluster can be set up as the following.
+As of v0.2.0 (`10a1bfb2f580`), the KinD cluster can be set up as the following.
 
 ```sh
 export SUBSTRATE_DIR=$(mktemp -d)
 git clone https://github.com/agent-substrate/substrate "$SUBSTRATE_DIR"
 cd "$SUBSTRATE_DIR"
-git checkout d909d690532b3e2e06496cfdd9e1200e56b2c27b
+git checkout v0.2.0
 
 # create a kind cluster
 hack/create-kind-cluster.sh
 
 # install Substrate
-hack/install-ate-kind.sh --deploy-ate-system
+hack/install-ate-kind.sh --deploy-ate-system --deploy-atenet
+
+# install kubectl-ate (make sure "$(go env GOPATH)/bin" is on your PATH), which creates
+# atespaces and ActorTemplates since those are Control API objects, not Kubernetes resources
+go install ./cmd/kubectl-ate
 
 # The rest of this guide's commands run from the checkpointd repo root.
 cd -
@@ -39,7 +43,7 @@ kubectl apply -f examples/llm-chat-demo/manifests/00-namespace.yaml \
 
 Substrate's `WorkerPool` is a pool of computing capacity which manages standby pods ready to run actors.
 
-See [Substrate's WorkerPool document](https://github.com/agent-substrate/substrate/blob/fda35d0c04e4d55c5ddb9e1ff50ed4e1ceafbf5f/docs/api-guide.md#1-workerpool-the-physical-capacity) for details.
+See [Substrate's WorkerPool document](https://github.com/agent-substrate/substrate/blob/v0.2.0/docs/api-guide.md#1-workerpool-the-physical-capacity) for details.
 
 See [`examples/llm-chat-demo/manifests/10-workerpool.yaml`](../examples/llm-chat-demo/manifests/10-workerpool.yaml) for the example manifest.
 
@@ -64,9 +68,9 @@ See [`examples/llm-chat-demo/chat-agent/main.go`](../examples/llm-chat-demo/chat
 
 Checkpointd's agent is deployed as an actor on Substrate.
 An actor is a sandboxed application managed by Substrate with checkpointing and resumption.
-To deploy an actor, an ActorTemplate resource containing its AgentCard in `CHECKPOINTD_AGENT_CARD` needs to be applied to Substrate.
+To deploy an actor, an ActorTemplate containing its AgentCard in `CHECKPOINTD_AGENT_CARD` needs to be created in Substrate.
 
-See [Substrate's ActorTemplate document](https://github.com/agent-substrate/substrate/blob/fda35d0c04e4d55c5ddb9e1ff50ed4e1ceafbf5f/docs/api-guide.md#2-actortemplate-the-workload-blueprint) for details.
+See [Substrate's ActorTemplate document](https://github.com/agent-substrate/substrate/blob/v0.2.0/docs/api-guide.md#2-actortemplate-the-workload-blueprint) for details.
 
 See [`examples/llm-chat-demo/manifests/20-actortemplate-chat-agent.yaml`](../examples/llm-chat-demo/manifests/20-actortemplate-chat-agent.yaml) and [`examples/llm-chat-demo/manifests/21-actortemplate-reviewer-agent.yaml`](../examples/llm-chat-demo/manifests/21-actortemplate-reviewer-agent.yaml) for the example ActorTemplates.
 
@@ -76,10 +80,16 @@ Supported environment variables:
 - `CHECKPOINTD_AGENT_CARD`(required): the AgentCard in JSON or YAML
 - `CHECKPOINTD_AGENT_ID`(optional): override the default agent ID (default: ActorTemplate .metadata.name)
 - `CHECKPOINTD_HARNESS_PORT`(optional): Port this agent listens to (default: 80)
+- `CHECKPOINTD_EGRESS_POLICY`(optional): the egress policy rules that every actor of this agent gets, as a single EgressPolicy document in JSON or YAML in Substrate's protojson shape (`metadata` may be omitted, and if present must name the policy `default` and the agent's own atespace). Substrate denies all outbound traffic from an actor that has no egress policy, so list every host the agent calls, including checkpointd itself if the agent resolves other agents' AgentCards. Without this variable the agent has no outbound access.
+
+The rules follow Substrate's [`EgressPolicy` definition](https://github.com/agent-substrate/substrate/blob/v0.2.0/pkg/proto/ateapipb/ateapi.proto#L402), and the example ActorTemplates above show them in use.
 
 In this example, two agents are deployed.
+Each agent's own atespace is the namespace its manifest names, so create it first.
 
 ```sh
+kubectl ate create atespace checkpointd-llm-chat-demo
+
 REGISTRY=localhost:5001
 
 CHAT_AGENT_IMAGE=$REGISTRY/chat-agent:dev
@@ -88,7 +98,7 @@ docker push $CHAT_AGENT_IMAGE
 digest=$(jq -r '."containerimage.digest"' /tmp/metadata.json)
 export CHAT_AGENT_IMAGE="$CHAT_AGENT_IMAGE@$digest"
 envsubst '${CHAT_AGENT_IMAGE}' < examples/llm-chat-demo/manifests/20-actortemplate-chat-agent.yaml \
-  | kubectl apply -f -
+  | kubectl ate create actor-template -f -
 
 REVIEWER_AGENT_IMAGE=$REGISTRY/reviewer-agent:dev
 docker build --target reviewer-agent --metadata-file=/tmp/metadata.json -f examples/llm-chat-demo/agents.Dockerfile -t $REVIEWER_AGENT_IMAGE .
@@ -96,22 +106,28 @@ docker push $REVIEWER_AGENT_IMAGE
 digest=$(jq -r '."containerimage.digest"' /tmp/metadata.json)
 export REVIEWER_AGENT_IMAGE="$REVIEWER_AGENT_IMAGE@$digest"
 envsubst '${REVIEWER_AGENT_IMAGE}' < examples/llm-chat-demo/manifests/21-actortemplate-reviewer-agent.yaml \
-  | kubectl apply -f -
+  | kubectl ate create actor-template -f -
+```
+
+A template is ready once its golden snapshot is built.
+
+```sh
+for t in chat-agent-template reviewer-agent-template; do
+  until kubectl ate get actor-template "$t" -a checkpointd-llm-chat-demo -o json \
+        | jq -e '.status.goldenSnapshotStatus.goldenTag.name' >/dev/null; do sleep 5; done
+done
 ```
 
 ## Deploying checkpointd
 
 Checkpointd is deployed as 2 replicas sharing a Postgres-backed event log, so either replica can pick up a session regardless of which one drove its earlier turns -- including recovering it if the other's own checkpointd process crashes. About replication of the checkpointd instances on a shared database, refer to [./replication.md](./replication.md).
 
-Checkpointd needs a ServiceAccount granting `get`, `list` and `watch` of actortemplates.ate.dev (to collect AgentCards of agents in the cluster), and `get` of pods (for the orphan-session salvage loop. see [`./replication.md`](./replication.md)).
+Checkpointd needs a ServiceAccount granting `get` of pods (for the orphan-session salvage loop. see [`./replication.md`](./replication.md)).
 
 - See [`examples/llm-chat-demo/manifests/89-postgres.yaml`](../examples/llm-chat-demo/manifests/89-postgres.yaml) for the example Postgres manifest.
 - See [`examples/llm-chat-demo/manifests/90-checkpointd-server.yaml`](../examples/llm-chat-demo/manifests/90-checkpointd-server.yaml) for the example manifest (ServiceAccount/Role/RoleBinding/StatefulSet/Service).
 - See [`examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml`](../examples/llm-chat-demo/manifests/85-checkpointd-configmap.yaml) for checkpointd's own config, as a ConfigMap, pointing at Postgres.
-
-Supported environment variable:
-
-- `CHECKPOINTD_KUBERNETES_NAMESPACE`(required when running with `--discover`): Kubernetes namespace checkpointd discovers agents from.
+- See [`./flags.md`](./flags.md) for supported flags.
 
 ```sh
 kubectl apply -f examples/llm-chat-demo/manifests/89-postgres.yaml

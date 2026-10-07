@@ -96,16 +96,13 @@ func (e *fakeExecution) Run(ctx context.Context, handler harness.Handler) error 
 func (e *fakeExecution) Checkpoint(ctx context.Context) error { return nil }
 func (e *fakeExecution) Close(ctx context.Context) error      { return nil }
 
-// fakeDeleterHarness additionally implements actorDeleter and
-// crashTagDeleter, recording every actorID it was asked to delete the actor
-// (or crash-recovery tag) for, for cleanupActors tests.
+// fakeDeleterHarness additionally implements actorDeleter, recording every
+// actorID it was asked to delete the actor for, for cleanupActors tests.
 type fakeDeleterHarness struct {
 	*fakeHarness
 
-	mu           sync.Mutex
-	deleted      []string
-	tagsDeleted  []string
-	deleteTagErr error // returned from DeleteCrashRecoveryTag when non-nil, for every actorID
+	mu      sync.Mutex
+	deleted []string
 }
 
 func (h *fakeDeleterHarness) DeleteActor(ctx context.Context, actorID string) error {
@@ -113,13 +110,6 @@ func (h *fakeDeleterHarness) DeleteActor(ctx context.Context, actorID string) er
 	h.deleted = append(h.deleted, actorID)
 	h.mu.Unlock()
 	return nil
-}
-
-func (h *fakeDeleterHarness) DeleteCrashRecoveryTag(ctx context.Context, actorID string) error {
-	h.mu.Lock()
-	h.tagsDeleted = append(h.tagsDeleted, actorID)
-	h.mu.Unlock()
-	return h.deleteTagErr
 }
 
 // latestText returns the text of the *last* Content_Text step, not the
@@ -624,19 +614,6 @@ func TestRelay_CleansUpVisitedActorsOnCompletion(t *testing.T) {
 	if len(a.deleted) == 1 && len(a.starts) == 1 && a.deleted[0] != a.starts[0] {
 		t.Errorf("agent a: deleted actor %q, want the same id it was started with (%q)", a.deleted[0], a.starts[0])
 	}
-
-	// cleanupActors also makes a best-effort attempt to delete each visited
-	// actor's crash-recovery snapshot tag, unconditionally -- a missing tag
-	// is already treated as success.
-	if len(a.tagsDeleted) != 1 {
-		t.Errorf("agent a: DeleteCrashRecoveryTag called %d times, want 1", len(a.tagsDeleted))
-	}
-	if len(b.tagsDeleted) != 1 {
-		t.Errorf("agent b: DeleteCrashRecoveryTag called %d times, want 1", len(b.tagsDeleted))
-	}
-	if len(a.tagsDeleted) == 1 && len(a.deleted) == 1 && a.tagsDeleted[0] != a.deleted[0] {
-		t.Errorf("agent a: deleted crash-recovery tag for actor %q, want the same actor id DeleteActor was called with (%q)", a.tagsDeleted[0], a.deleted[0])
-	}
 }
 
 // TestDriveRelayLoop_StopsWhenSessionMarkedTerminatingMidFlight confirms a
@@ -773,36 +750,6 @@ func TestCleanupActors_IncludesActorDispatchedButNeverReplied(t *testing.T) {
 	}
 	if len(b.deleted) != 1 {
 		t.Errorf("agent b: DeleteActor called %d times, want 1 -- it was dispatched to but never replied, and must still be cleaned up, not leaked", len(b.deleted))
-	}
-}
-
-// TestRelay_CleanupContinuesAfterCrashTagDeleteFails confirms
-// cleanupActors treats a failed DeleteCrashRecoveryTag the same
-// best-effort way it already treats a failed DeleteActor: logged and
-// skipped, never aborting cleanup for the other actors a task visited.
-func TestRelay_CleanupContinuesAfterCrashTagDeleteFails(t *testing.T) {
-	a := &fakeDeleterHarness{deleteTagErr: errors.New("boom"), fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
-		return envNew(a2a.MessageRoleAgent, "a", "b", "from-a:"+textOf(inMessage(in))), nil
-	}}}
-	b := &fakeDeleterHarness{fakeHarness: &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
-		return envNew(a2a.MessageRoleAgent, "b", "", "from-b:"+textOf(inMessage(in))), nil
-	}}}
-	c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a, "b": b})
-
-	if _, _, err := testRelay(context.Background(), t, c, el, store, "a", "seed"); err != nil {
-		t.Fatalf("testRelay: %v", err)
-	}
-
-	// a's own actor delete and b's whole cleanup (actor + tag) still ran,
-	// despite a's tag delete failing.
-	if len(a.deleted) != 1 {
-		t.Errorf("agent a: DeleteActor called %d times, want 1 (a failed tag delete must not skip the actor delete)", len(a.deleted))
-	}
-	if len(b.deleted) != 1 {
-		t.Errorf("agent b: DeleteActor called %d times, want 1 (agent a's failure must not abort cleanup for agent b)", len(b.deleted))
-	}
-	if len(b.tagsDeleted) != 1 {
-		t.Errorf("agent b: DeleteCrashRecoveryTag called %d times, want 1", len(b.tagsDeleted))
 	}
 }
 

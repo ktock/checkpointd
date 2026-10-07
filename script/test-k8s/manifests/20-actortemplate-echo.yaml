@@ -13,31 +13,45 @@
 # limitations under the License.
 
 # ActorTemplate for the plain echo agent, recognized as "echo-agent" by checkpointd's --discover.
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
 metadata:
+  atespace: ${ATESPACE}
   name: echo-template
-  namespace: ${NS}
-spec:
-  workerSelector:
-    matchLabels:
-      workload: ${NS}-harness
-  containers:
-    - name: echo
-      image: "${ECHO_IMAGE}"
-      # Serves just the HarnessService in plaintext on :80.
-      command: ["/app/echo-agent", "--harness-addr", "0.0.0.0:80", "--agent-id", "echo-agent"]
-      env:
-        # CHECKPOINTD_AGENT/AGENT_ID opt this ActorTemplate into checkpointd's --discover, and CHECKPOINTD_AGENT_CARD exposes it at /agents/<id>/.
-        - name: CHECKPOINTD_AGENT
-          value: "true"
-        - name: CHECKPOINTD_AGENT_ID
-          value: echo-agent
-        - name: CHECKPOINTD_AGENT_CARD
-          value: |
-            name: Echo Agent
-            description: Echoes back whatever it's sent -- script/test-k8s/agents/echo_agent, discovered by crash-test-agent via a real AgentCard fetch before it relays to it
-            version: 1.0.0
-  # snapshotsConfig.location makes SuspendActor/ResumeActor a true checkpoint/resume of this process's in-memory state.
-  snapshotsConfig:
-    location: "gs://ate-snapshots/${NS}/echo/"
+workerSelector:
+  matchLabels:
+    workload: ${NS}-harness
+containers:
+  - name: echo
+    image: "${ECHO_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    # Serves just the HarnessService in plaintext on :80.
+    command: ["/app/echo-agent", "--harness-addr", "0.0.0.0:80", "--agent-id", "echo-agent"]
+    env:
+      # CHECKPOINTD_AGENT/AGENT_ID opt this ActorTemplate into checkpointd's --discover, and CHECKPOINTD_AGENT_CARD exposes it at /agents/<id>/.
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: echo-agent
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Echo Agent
+          description: Echoes back whatever it's sent -- script/test-k8s/agents/echo_agent, discovered by crash-test-agent via a real AgentCard fetch before it relays to it
+          version: 1.0.0
+# FULL snapshot scope makes SuspendActor/ResumeActor a true checkpoint/resume of this process's in-memory state.
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/${NS}/echo/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

@@ -23,7 +23,7 @@
 #   docker build --platform linux/amd64 --target checkpointd -f cmd/Dockerfile -t <ref> . && docker push <ref>
 
 # --- Stage 1: build the checkpointd Go binary --------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src

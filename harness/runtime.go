@@ -19,8 +19,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"iter"
 	"log"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -76,6 +79,9 @@ type actorRuntime struct {
 	// processID identifies this process instance, for diagnostics.
 	processID string
 
+	// actorNameFile is where Substrate projects this actor's own name, if the ActorTemplate mounts it.
+	actorNameFile string
+
 	mu       sync.Mutex
 	waiting  map[string]*pendingCall // keyed by Envelope.Correlation
 	inFlight map[string]*roundResult // keyed by hop.Envelope.StepID
@@ -111,7 +117,25 @@ type roundResult struct {
 func newActorRuntime(fn invocationFunc) *actorRuntime {
 	processID := uuid.NewString()
 	log.Printf("harness: actorRuntime process instance %s starting", processID)
-	return &actorRuntime{processID: processID, fn: fn, waiting: make(map[string]*pendingCall), inFlight: make(map[string]*roundResult), mintedTaskIDs: make(map[a2a.TaskID]struct{}), mintedContextIDs: make(map[string]struct{})}
+	return &actorRuntime{processID: processID, actorNameFile: defaultActorNameFile, fn: fn, waiting: make(map[string]*pendingCall), inFlight: make(map[string]*roundResult), mintedTaskIDs: make(map[a2a.TaskID]struct{}), mintedContextIDs: make(map[string]struct{})}
+}
+
+// defaultActorNameFile is where an ActorTemplate's systemInfo volume projects the actor's name when mounted at /run/ate.
+const defaultActorNameFile = "/run/ate/actor-name"
+
+// verifyActor rejects a turn addressed to a different actor than this one.
+func (rt *actorRuntime) verifyActor(conversationID string) error {
+	b, err := os.ReadFile(rt.actorNameFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "reading this actor's name from %s: %v", rt.actorNameFile, err)
+	}
+	if name := strings.TrimSpace(string(b)); name != conversationID {
+		return status.Errorf(codes.FailedPrecondition, "this turn is for actor %q but reached actor %q: it was routed to the wrong actor", conversationID, name)
+	}
+	return nil
 }
 
 // Connect drives one turn.
@@ -121,6 +145,9 @@ func (rt *actorRuntime) Connect(stream proto.HarnessService_ConnectServer) error
 		return err
 	}
 	convID := req.GetConversationId()
+	if err := rt.verifyActor(convID); err != nil {
+		return err
+	}
 	agentID := req.GetAgentId()
 
 	steps := req.GetStart().GetSteps()

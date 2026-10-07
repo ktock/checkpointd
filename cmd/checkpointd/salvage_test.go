@@ -18,6 +18,8 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -423,4 +425,36 @@ func pollTaskState(t *testing.T, store *sqlTaskStore, sessionID string, want a2a
 	if stored.Task.Status.State != want {
 		t.Errorf("task %s state = %q, want %q", taskID, stored.Task.Status.State, want)
 	}
+}
+
+func TestOwnNamespace(t *testing.T) {
+	writeNamespaceFile := func(t *testing.T, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "namespace")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("reads the pod's own namespace file", func(t *testing.T) {
+		if got, err := ownNamespace("", writeNamespaceFile(t, "from-file\n")); err != nil || got != "from-file" {
+			t.Fatalf("ownNamespace = %q, %v; want from-file", got, err)
+		}
+	})
+	t.Run("the flag overrides the file", func(t *testing.T) {
+		if got, err := ownNamespace("from-flag", writeNamespaceFile(t, "from-file\n")); err != nil || got != "from-flag" {
+			t.Fatalf("ownNamespace = %q, %v; want from-flag", got, err)
+		}
+	})
+	t.Run("an empty file is an error", func(t *testing.T) {
+		if _, err := ownNamespace("", writeNamespaceFile(t, "\n")); err == nil {
+			t.Fatal("ownNamespace with an empty file and no override returned nil error")
+		}
+	})
+	t.Run("a missing file is an error", func(t *testing.T) {
+		if _, err := ownNamespace("", filepath.Join(t.TempDir(), "absent")); err == nil {
+			t.Fatal("ownNamespace with no file and no override returned nil error")
+		}
+	})
 }

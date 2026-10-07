@@ -66,7 +66,8 @@
 # Usage: script/test-k8s/test.sh
 #
 # Env overrides:
-#   CHECKPOINTD_K8S_NAMESPACE       Namespace to deploy into (default: checkpointd-k8s-test)
+#   CHECKPOINTD_K8S_NAMESPACE       Kubernetes namespace to deploy into (default: checkpointd-k8s-test)
+#   CHECKPOINTD_K8S_ATESPACE        Agent Substrate atespace for the ActorTemplates and actors, kept separate from the Kubernetes namespace (default: checkpointd-k8s-atespace)
 #   CHECKPOINTD_K8S_REGISTRY        Registry to push images to (default: the shared "kind-registry")
 #   KIND_CLUSTER_NAME            kind cluster to create (default: checkpointd-test-k8s)
 #   KIND_WORKER_NODES            Worker nodes alongside the one control-plane (default: 3)
@@ -85,6 +86,7 @@ K8S_DIR="$REPO_ROOT/script/test-k8s/manifests"
 cd "$REPO_ROOT"
 
 NS="${CHECKPOINTD_K8S_NAMESPACE:-checkpointd-k8s-test}"
+ATESPACE="${CHECKPOINTD_K8S_ATESPACE:-checkpointd-k8s-atespace}"
 REGISTRY="${CHECKPOINTD_K8S_REGISTRY:-}"
 IMAGE_TAG="dev"
 
@@ -96,7 +98,7 @@ export KUBECTL_CONTEXT
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate}"
 SUBSTRATE_BRANCH="${SUBSTRATE_BRANCH:-main}"
 # Pinned to a recent agent-substrate/substrate commit for reproducibility.
-SUBSTRATE_COMMIT="${SUBSTRATE_COMMIT:-d909d690532b3e2e06496cfdd9e1200e56b2c27b}"
+SUBSTRATE_COMMIT="${SUBSTRATE_COMMIT:-10a1bfb2f58039608a0b8419379714945e4d65ac}"
 
 # Longer than install-ate-kind.sh's own default, to give a kind cluster's first install more room.
 ATE_INSTALL_ROLLOUT_TIMEOUT="${ATE_INSTALL_ROLLOUT_TIMEOUT:-180s}"
@@ -108,6 +110,7 @@ CHECKPOINTD_SERVER_LOCAL_PORT=""
 TESTSERVER_LOCAL_PORT=""
 
 source "$SCRIPT_DIR/lib.sh"
+source "$REPO_ROOT/script/lib/ate-templates.sh"
 
 # --- Resolve which subtests to run, and which images/manifests they need ----
 
@@ -329,7 +332,8 @@ build_and_push() {
   log "  building $name ($target)"
   local target_flag=()
   [[ -n "$target" ]] && target_flag=(--target "$target")
-  docker build "${target_flag[@]}" -f "$dockerfile" -t "$ref" "$REPO_ROOT" >&2
+  # A failed build must fail explicitly because set -e does not apply inside command substitutions.
+  docker build "${target_flag[@]}" -f "$dockerfile" -t "$ref" "$REPO_ROOT" >&2 || fail "docker build of $name failed"
   log "  pushing $name"
   local digest
   digest="$(docker push "$ref" 2>&1 | tee >(cat >&2) | grep -oE 'digest: sha256:[0-9a-f]+' | awk '{print $2}')"
@@ -392,10 +396,10 @@ CHECKPOINTD_TERMINATION_GRACE_SECONDS="${CHECKPOINTD_TERMINATION_GRACE_SECONDS:-
 CHECKPOINTD_SALVAGE_SWEEP_INTERVAL="${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL:-5s}"
 
 log "rendering manifests (workdir: $WORKDIR)"
-export NS CHECKPOINTD_IMAGE ECHO_IMAGE LONG_WAIT_IMAGE LONG_POLL_IMAGE TESTSERVER_IMAGE \
+export NS ATESPACE CHECKPOINTD_IMAGE ECHO_IMAGE LONG_WAIT_IMAGE LONG_POLL_IMAGE TESTSERVER_IMAGE \
   TCK_AGENT_IMAGE CRASH_TEST_AGENT_IMAGE CRASH_RECOVERY_AGENT_IMAGE AGENT_A_IMAGE AGENT_B_IMAGE ATEOM_IMAGE \
   CHECKPOINTD_REPLICAS CHECKPOINTD_TERMINATION_GRACE_SECONDS CHECKPOINTD_SALVAGE_SWEEP_INTERVAL
-render_vars='${NS} ${CHECKPOINTD_IMAGE} ${ECHO_IMAGE} ${LONG_WAIT_IMAGE} ${LONG_POLL_IMAGE} ${TESTSERVER_IMAGE} ${TCK_AGENT_IMAGE} ${CRASH_TEST_AGENT_IMAGE} ${CRASH_RECOVERY_AGENT_IMAGE} ${AGENT_A_IMAGE} ${AGENT_B_IMAGE} ${ATEOM_IMAGE} ${CHECKPOINTD_REPLICAS} ${CHECKPOINTD_TERMINATION_GRACE_SECONDS} ${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL}'
+render_vars='${NS} ${ATESPACE} ${CHECKPOINTD_IMAGE} ${ECHO_IMAGE} ${LONG_WAIT_IMAGE} ${LONG_POLL_IMAGE} ${TESTSERVER_IMAGE} ${TCK_AGENT_IMAGE} ${CRASH_TEST_AGENT_IMAGE} ${CRASH_RECOVERY_AGENT_IMAGE} ${AGENT_A_IMAGE} ${AGENT_B_IMAGE} ${ATEOM_IMAGE} ${CHECKPOINTD_REPLICAS} ${CHECKPOINTD_TERMINATION_GRACE_SECONDS} ${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL}'
 for f in "${NEEDED_MANIFEST_FILES[@]}"; do
   envsubst "$render_vars" < "$K8S_DIR/$f" > "$WORKDIR/$f"
 done
@@ -413,14 +417,9 @@ for a in "${!NEEDED_AGENTS[@]}"; do
   done
 done
 
-log "applying ActorTemplates (${ACTOR_TEMPLATES[*]})"
+log "creating ActorTemplates (${ACTOR_TEMPLATES[*]})"
 for a in "${!NEEDED_AGENTS[@]}"; do
-  run_kubectl apply -f "$WORKDIR/${AGENT_MANIFEST[$a]}"
-done
-
-log "waiting for ActorTemplates to become Ready"
-for t in "${ACTOR_TEMPLATES[@]}"; do
-  run_kubectl -n "$NS" wait --for=condition=Ready "actortemplate/$t" --timeout=180s
+  ate_create_actor_templates "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$WORKDIR/${AGENT_MANIFEST[$a]}"
 done
 
 log "waiting for the WorkerPool to reach its desired replicas"
@@ -431,6 +430,12 @@ for i in $(seq 1 60); do
   sleep 5
 done
 [[ -n "${ready:-}" && "$ready" == "${want:-}" ]] || fail "WorkerPool checkpointd-k8s-test-harness never reached $want ready replicas (got: ${ready:-0})"
+
+# A template's golden snapshot is built on a worker from the pool, so this has to wait for the pool.
+log "waiting for ActorTemplates to build their golden snapshots"
+for t in "${ACTOR_TEMPLATES[@]}"; do
+  ate_wait_actor_template_golden "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$ATESPACE" "$t" 180
+done
 
 if [[ "$NEEDED_TESTSERVER" == "1" ]]; then
   log "applying the testserver Deployment/Service"

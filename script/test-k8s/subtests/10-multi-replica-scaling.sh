@@ -25,7 +25,7 @@
 #   C) the broader scale-up/scale-down cycle preserves both a parked
 #      (InputRequired) and an actively-RUNNING session, reached the normal
 #      way through the plain round-robin svc/checkpointd-server throughout;
-#   D) a *non-graceful* force-kill of the owning instance's own pod (not a
+#   D) a *non-graceful* SIGKILL of the owning instance's own process (not a
 #      graceful kubectl scale) while it actively owns a RUNNING session
 #      still recovers correctly and exactly once -- either through the
 #      same-named StatefulSet replacement's own startup self-recovery
@@ -78,7 +78,7 @@ subtest_multi_replica_scaling() {
   # *fourth*, redundant relay (e.g. double-driven from both instances at
   # once), not against agent-b's own expected turn count. Both pods are
   # still up here, so the multi-pod log scrape sees everything.
-  checkCallNotRepeatedAcrossPods "$a_tenant" "agent-b" 3 "scenario A"
+  checkCallNotRepeated "$a_tenant" "agent-b" 3 "scenario A"
 
   # --- Scenario B: the owning instance is scaled in before continuation ----
 
@@ -238,13 +238,13 @@ subtest_multi_replica_scaling() {
   run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=180s \
     || { dumpAllCheckpointdServerLogs; fail "checkpointd-server never finished scaling back up to $initial_replicas replicas for scenario D"; }
 
-  log "=== scenario D: checkpointd-server-0 is force-killed (not scaled out) while it owns a RUNNING long-poll session ==="
+  log "=== scenario D: checkpointd-server-0 is SIGKILLed (not scaled out) while it owns a RUNNING long-poll session ==="
   local fwd1d port1d pid1d
   fwd1d="$(portForwardToPod checkpointd-server-0 80)" || fail "could not port-forward directly to checkpointd-server-0"
   port1d="${fwd1d%% *}"; pid1d="${fwd1d##* }"
   local directURL1d="http://127.0.0.1:$port1d/agents/long-poll/"
 
-  local LONG_WAIT_ID_D="multi-replica-force-kill-$(date +%s)"
+  local LONG_WAIT_ID_D="multi-replica-kill-$(date +%s)"
   local d_out d_task_id d_tenant
   d_out="$(a2a_cli send --immediate "$directURL1d" -o json "$LONG_WAIT_ID_D")" || { kill "$pid1d" 2>/dev/null; fail "a2a send directly to checkpointd-server-0 failed"; }
   d_task_id="$(echo "$d_out" | jq -r '.id // empty')"
@@ -257,11 +257,12 @@ subtest_multi_replica_scaling() {
 
   local killed_uid
   killed_uid="$(run_kubectl -n "$NS" get pod checkpointd-server-0 -o jsonpath='{.metadata.uid}')"
-  [[ -n "$killed_uid" ]] || fail "could not read checkpointd-server-0's uid before force-killing it"
-  log "  force-deleting checkpointd-server-0 itself (uid $killed_uid) -- NOT a graceful kubectl scale, so no drain ever runs and owner_pod/owner_uid are left stale in the sessions table"
-  run_kubectl -n "$NS" delete pod checkpointd-server-0 --grace-period=0 --force --wait=false
+  [[ -n "$killed_uid" ]] || fail "could not read checkpointd-server-0's uid before killing it"
+  log "  SIGKILLing checkpointd-server-0's own process (uid $killed_uid) -- NOT a graceful kubectl scale, so no drain ever runs and owner_pod/owner_uid are left stale in the sessions table"
+  signalCheckpointd checkpointd-server-0 KILL
+  # The StatefulSet controller only replaces a Failed pod, so the old process has exited by the time its pod object is gone (docs/replication.md).
   confirmPodGone "$NS" checkpointd-server-0 "$killed_uid" \
-    || fail "scenario D: checkpointd-server-0 (uid $killed_uid) was not actually removed by the force-delete within the expected time"
+    || { dumpAllCheckpointdServerLogs; fail "scenario D: checkpointd-server-0 (uid $killed_uid) was not replaced after its process was SIGKILLed"; }
   log "  checkpointd-server-0 (uid $killed_uid) confirmed gone -- task $d_task_id's session is now a genuine orphan (owner_pod=checkpointd-server-0, owner_uid=$killed_uid, nobody driving it)"
 
   log "  releasing long-wait's notification so checkpointd-server-0's orphaned session can complete once recovered"
@@ -274,7 +275,7 @@ subtest_multi_replica_scaling() {
 
   log "  polling for task $d_task_id to recover and complete -- either checkpointd-server-0's own StatefulSet-recreated replacement (same name) self-recovers it at its own startup via resumeServerSessions, or a surviving instance's periodic salvage sweep claims it first, whichever wins the race"
   pollTaskState "$LONG_POLL_URL" "$d_task_id" "$d_tenant" TASK_STATE_COMPLETED \
-    || { dumpAllCheckpointdServerLogs; fail "scenario D: task $d_task_id was never recovered and completed after checkpointd-server-0 was force-killed (last response: $LAST_GET_OUT)"; }
+    || { dumpAllCheckpointdServerLogs; fail "scenario D: task $d_task_id was never recovered and completed after checkpointd-server-0 was killed (last response: $LAST_GET_OUT)"; }
 
   # Reports which path actually won this run, without hard-asserting
   # either: both are correct outcomes, and which one wins a given race is

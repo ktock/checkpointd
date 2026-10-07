@@ -18,6 +18,9 @@ harness.Serve(harnessAddr, harness.NewAgentHarness(a2asrv.AgentExecutorFunc(myAg
 
 Checkpointd exposes all agents' AgentCards on the `/agents/{id}/.well-known/agent-card.json` endpoint and the standard `agentcard.DefaultResolver.Resolve` can be used to fetch a card for agent discovery.
 
+The card is fetched over HTTP from inside the agent's sandbox, and Substrate denies all outbound traffic from an actor without an egress policy.
+Allow it, and any other host the agent calls, with `CHECKPOINTD_EGRESS_POLICY` on the agent's ActorTemplate, described in [`./deployment.md`](./deployment.md).
+
 ### Sending a message
 
 An agent client can be instantiated using the standard `NewFromCard` function of a2a-go.

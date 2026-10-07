@@ -37,7 +37,7 @@ subtest_cancel_task() {
   wait_actor="$(actorName "$tenant" long-wait)"
   local found=0 i actors_json
   for i in $(seq 1 60); do
-    actors_json="$(run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null)"
+    actors_json="$(run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null)"
     if echo "$actors_json" | jq -e --arg a "$poll_actor" --arg b "$wait_actor" \
         '(.actors // []) as $actors | ($actors | any(.metadata.name == $a)) and ($actors | any(.metadata.name == $b))' >/dev/null 2>&1; then
       found=1
@@ -58,7 +58,7 @@ subtest_cancel_task() {
   log "polling for both actors to actually be deleted -- this only happens once driveRelayLoop's own next per-hop check notices the session is TERMINATING and runs finishTermination/cleanupActors, proving the relay loop actually stopped rather than continuing to drive already-canceled work"
   local gone=0
   for i in $(seq 1 60); do
-    actors_json="$(run_kubectl_ate get actors -a "$NS" -o json 2>/dev/null)"
+    actors_json="$(run_kubectl_ate get actors -a "$ATESPACE" -o json 2>/dev/null)"
     if ! echo "$actors_json" | jq -e --arg a "$poll_actor" --arg b "$wait_actor" \
         '(.actors // []) as $actors | ($actors | any(.metadata.name == $a)) or ($actors | any(.metadata.name == $b))' >/dev/null 2>&1; then
       gone=1

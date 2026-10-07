@@ -19,10 +19,13 @@
 package checkpointd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/ktock/checkpointd/internal/ate"
 	"github.com/ktock/checkpointd/internal/harness"
 	"github.com/ktock/checkpointd/internal/harness/substrate"
 	"gopkg.in/yaml.v3"
@@ -65,14 +68,15 @@ type RegistryConfig struct {
 // SubstrateHarnessConfig configures one custom harness deployed as a
 // substrate actor.
 type SubstrateHarnessConfig struct {
-	ID        string           `yaml:"id"`                   // Unique harness identifier
-	Namespace string           `yaml:"namespace"`            // ActorTemplate namespace
-	Template  string           `yaml:"template"`             // ActorTemplate name
-	Port      int              `yaml:"port,omitempty"`       // HarnessService port
-	Default   bool             `yaml:"default,omitempty"`    // Default harness or not
-	AgentCard *AgentCardConfig `yaml:"agent_card,omitempty"` // AgentCard of this agent
-	Endpoint  string           `yaml:"endpoint,omitempty"`   // Custom substrate address
-	SuspendActorTimeout string `yaml:"suspend_actor_timeout,omitempty"` // SuspendActor timeout
+	ID                  string           `yaml:"id"`                              // Unique harness identifier
+	Namespace           string           `yaml:"namespace"`                       // ActorTemplate namespace
+	Template            string           `yaml:"template"`                        // ActorTemplate name
+	Port                int              `yaml:"port,omitempty"`                  // HarnessService port
+	Default             bool             `yaml:"default,omitempty"`               // Default harness or not
+	AgentCard           *AgentCardConfig `yaml:"agent_card,omitempty"`            // AgentCard of this agent
+	Endpoint            string           `yaml:"endpoint,omitempty"`              // Custom substrate address
+	SuspendActorTimeout string           `yaml:"suspend_actor_timeout,omitempty"` // SuspendActor timeout
+	EgressPolicy        any              `yaml:"egress_policy,omitempty"`         // Egress policy rules every actor of this harness gets
 }
 
 // AgentCardConfig is the user-authored subset of a2a.AgentCard.
@@ -116,7 +120,28 @@ func (c SubstrateHarnessConfig) NewHarness(endpoint string, ctrlOpts substrate.C
 	if err != nil {
 		return nil, fmt.Errorf("substrate harness %q: %w", c.ID, err)
 	}
-	return newSubstrateHarness(c.ID, endpoint, c.Namespace, c.Template, port, suspendActorTimeout, ctrlOpts)
+	egressPolicy, err := c.egressPolicy()
+	if err != nil {
+		return nil, fmt.Errorf("substrate harness %q: %w", c.ID, err)
+	}
+	h, err := newSubstrateHarness(c.ID, endpoint, c.Namespace, c.Template, port, suspendActorTimeout, ctrlOpts)
+	if err != nil {
+		return nil, err
+	}
+	h.SetEgressPolicy(egressPolicy)
+	return h, nil
+}
+
+// egressPolicy parses c.EgressPolicy, which is nil when the harness needs no egress.
+func (c SubstrateHarnessConfig) egressPolicy() (*ateapipb.EgressPolicy, error) {
+	if c.EgressPolicy == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(c.EgressPolicy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid egress_policy: %w", err)
+	}
+	return ate.ParseEgressPolicy(raw)
 }
 
 // suspendActorTimeout parses c.SuspendActorTimeout.
@@ -133,12 +158,8 @@ func (c SubstrateHarnessConfig) suspendActorTimeout() (time.Duration, error) {
 }
 
 // newSubstrateHarness brings up a harness that is deployed as a substrate actor.
-func newSubstrateHarness(harnessID, endpoint, namespace, template string, port int, suspendActorTimeout time.Duration, ctrlOpts substrate.ControlAPIOptions) (harness.Harness, error) {
-	sh, err := substrate.New(harnessID, endpoint, namespace, template, port, suspendActorTimeout, ctrlOpts)
-	if err != nil {
-		return nil, err
-	}
-	return sh, nil
+func newSubstrateHarness(harnessID, endpoint, namespace, template string, port int, suspendActorTimeout time.Duration, ctrlOpts substrate.ControlAPIOptions) (*substrate.SubstrateHarness, error) {
+	return substrate.New(harnessID, endpoint, namespace, template, port, suspendActorTimeout, ctrlOpts)
 }
 
 // LoadFromFile loads configuration from a YAML file.

@@ -39,6 +39,7 @@ cd "$REPO_ROOT"
 
 log() { echo "[llm-chat-demo setup] $*" >&2; }
 fail() { echo "[llm-chat-demo setup] FAIL: $*" >&2; exit 1; }
+source "$REPO_ROOT/script/lib/ate-templates.sh"
 
 NS="checkpointd-llm-chat-demo"
 IMAGE_TAG="dev"
@@ -52,11 +53,11 @@ run_kubectl() { kubectl --context "$KUBECTL_CONTEXT" "$@"; }
 
 SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate}"
 SUBSTRATE_BRANCH="${SUBSTRATE_BRANCH:-main}"
-SUBSTRATE_COMMIT="${SUBSTRATE_COMMIT:-d909d690532b3e2e06496cfdd9e1200e56b2c27b}"
+SUBSTRATE_COMMIT="${SUBSTRATE_COMMIT:-10a1bfb2f58039608a0b8419379714945e4d65ac}"
 ATE_INSTALL_ROLLOUT_TIMEOUT="${ATE_INSTALL_ROLLOUT_TIMEOUT:-180s}"
 export ATE_INSTALL_ROLLOUT_TIMEOUT
 
-log "checking docker, kind, kubectl, go, git, envsubst"
+log "checking docker, kind, kubectl, go, git, envsubst, jq"
 command -v docker >/dev/null 2>&1 || fail "docker not found on PATH"
 docker info >/dev/null 2>&1 || fail "docker is installed but not usable (daemon not reachable) -- please fix docker first"
 command -v kind >/dev/null 2>&1 || fail "kind not found on PATH"
@@ -64,6 +65,7 @@ command -v kubectl >/dev/null 2>&1 || fail "kubectl not found on PATH"
 command -v go >/dev/null 2>&1 || fail "go not found on PATH"
 command -v git >/dev/null 2>&1 || fail "git not found on PATH"
 command -v envsubst >/dev/null 2>&1 || fail "envsubst not found on PATH (part of gettext-base, used to render manifests)"
+command -v jq >/dev/null 2>&1 || fail "jq not found on PATH (used to parse kubectl-ate JSON output)"
 
 SUBSTRATE_DIR="$(mktemp -d -t checkpointd-llm-chat-demo-substrate.XXXXXXXX)"
 WORKDIR="$(mktemp -d -t checkpointd-llm-chat-demo-manifests.XXXXXXXX)"
@@ -77,6 +79,12 @@ git clone --branch "$SUBSTRATE_BRANCH" --single-branch --quiet "$SUBSTRATE_REPO"
   || fail "could not clone $SUBSTRATE_REPO@$SUBSTRATE_BRANCH"
 git -C "$SUBSTRATE_DIR" checkout --quiet "$SUBSTRATE_COMMIT" \
   || fail "commit $SUBSTRATE_COMMIT not found on $SUBSTRATE_REPO@$SUBSTRATE_BRANCH"
+
+# ActorTemplates are Control API objects rather than Kubernetes CRDs, so kubectl-ate creates them.
+KUBECTL_ATE_BIN="$SUBSTRATE_DIR/bin/kubectl-ate"
+log "building kubectl-ate"
+(cd "$SUBSTRATE_DIR" && go build -o "$KUBECTL_ATE_BIN" ./cmd/kubectl-ate) \
+  || fail "could not build kubectl-ate from $SUBSTRATE_DIR"
 
 log "creating kind cluster '$KIND_CLUSTER_NAME' ($KIND_WORKER_NODES worker node(s)) and its own registry"
 # create-kind-cluster.sh prints this cluster's own registry address as its sole stdout line.
@@ -112,7 +120,8 @@ build_and_push() {
   local dockerfile=$1 target=$2 name=$3
   local ref="$REGISTRY/checkpointd-llm-chat-demo-$name:$IMAGE_TAG"
   log "  building $name ($target)"
-  docker build --target "$target" -f "$dockerfile" -t "$ref" "$REPO_ROOT" >&2
+  # A failed build must fail explicitly because set -e does not apply inside command substitutions.
+  docker build --target "$target" -f "$dockerfile" -t "$ref" "$REPO_ROOT" >&2 || fail "docker build of $name failed"
   log "  pushing $name"
   local digest
   digest="$(docker push "$ref" 2>&1 | tee >(cat >&2) | grep -oE 'digest: sha256:[0-9a-f]+' | awk '{print $2}')"
@@ -152,14 +161,13 @@ log "waiting for llama-completion to become Ready (up to 3 minutes -- downloadin
 run_kubectl -n "$NS" rollout status deployment/llama-completion --timeout=180s \
   || fail "llama-completion never became Ready -- check 'kubectl -n $NS logs deployment/llama-completion -c fetch-model' and '... -c llama-server'"
 
-# Applied before checkpointd-server, so its first synchronous discovery pass finds both agents immediately.
-log "applying ActorTemplates (chat-agent, reviewer-agent) -- before checkpointd-server"
-run_kubectl apply -f "$WORKDIR/20-actortemplate-chat-agent.yaml"
-run_kubectl apply -f "$WORKDIR/21-actortemplate-reviewer-agent.yaml"
-run_kubectl -n "$NS" wait --for=condition=Ready actortemplate/chat-agent-template --timeout=180s \
-  || fail "chat-agent-template never became Ready"
-run_kubectl -n "$NS" wait --for=condition=Ready actortemplate/reviewer-agent-template --timeout=180s \
-  || fail "reviewer-agent-template never became Ready"
+# Created before checkpointd-server, so its first synchronous discovery pass finds both agents immediately.
+log "creating ActorTemplates (chat-agent, reviewer-agent) -- before checkpointd-server"
+ate_create_actor_templates "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$WORKDIR/20-actortemplate-chat-agent.yaml"
+ate_create_actor_templates "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$WORKDIR/21-actortemplate-reviewer-agent.yaml"
+log "waiting for both ActorTemplates to build their golden snapshots (up to 3 minutes each)"
+ate_wait_actor_template_golden "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$NS" chat-agent-template 180
+ate_wait_actor_template_golden "$KUBECTL_ATE_BIN" "$KUBECTL_CONTEXT" "$NS" reviewer-agent-template 180
 
 log "applying Postgres (shared eventlog/session store for both checkpointd-server replicas)"
 run_kubectl apply -f "$WORKDIR/89-postgres.yaml"
@@ -172,6 +180,6 @@ run_kubectl apply -f "$WORKDIR/90-checkpointd-server.yaml"
 
 log "waiting for both checkpointd-server replicas to discover both agents (readinessProbe, up to 3 minutes)"
 run_kubectl -n "$NS" rollout status statefulset/checkpointd-server --timeout=180s \
-  || fail "checkpointd-server's readinessProbe never passed on both replicas -- see 'kubectl -n $NS logs -l app=checkpointd-server --all-containers --prefix', and 'kubectl -n $NS get actortemplates'"
+  || fail "checkpointd-server's readinessProbe never passed on both replicas -- see 'kubectl -n $NS logs -l app=checkpointd-server --all-containers --prefix', and 'kubectl ate get actor-templates -a $NS' (needs the kubectl-ate plugin)"
 
 log "PASS -- chat-agent and reviewer-agent are deployed and discovered. Next: examples/llm-chat-demo/demo.sh"

@@ -24,9 +24,6 @@ metadata:
   name: checkpointd-server
   namespace: ${NS}
 rules:
-  - apiGroups: ["ate.dev"]
-    resources: ["actortemplates"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
@@ -72,6 +69,8 @@ spec:
             - /checkpointd-app/checkpointd
             - --config=/etc/checkpointd/checkpointd.yaml
             - --discover
+            # Scopes --discover to this test's atespace instead of every atespace.
+            - --discover-atespace=${ATESPACE}
             - --addr=:80
             - --base-url=http://checkpointd-server.${NS}.svc:80
             - --substrate-ca-file=/var/run/secrets/ate-system/ca.crt
@@ -80,10 +79,6 @@ spec:
             - --salvage-sweep-interval=${CHECKPOINTD_SALVAGE_SWEEP_INTERVAL}
             - --log-level=debug
           env:
-            - name: CHECKPOINTD_KUBERNETES_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             - name: POD_NAME
               valueFrom:
                 fieldRef:

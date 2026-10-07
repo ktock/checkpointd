@@ -19,8 +19,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1690,5 +1693,61 @@ func TestBuildAgentCard_SkillTagsNeverNil(t *testing.T) {
 	}
 	if strings.Contains(string(b), `"tags":null`) {
 		t.Errorf("marshaled card contains \"tags\":null, want an empty array instead: %s", b)
+	}
+}
+
+// TestWaitForBaseURL_WaitsUntilReady confirms startup waits through unready answers and returns once /ready answers 200.
+func TestWaitForBaseURL_WaitsUntilReady(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ready" {
+			t.Errorf("probed %q, want /ready", r.URL.Path)
+		}
+		if calls.Add(1) <= 3 {
+			http.Error(w, "not yet", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if !waitForBaseURL(context.Background(), srv.URL+"/", 5*time.Second, 5*time.Millisecond) {
+		t.Fatal("waitForBaseURL = false, want true once the server answers 200")
+	}
+	if got := calls.Load(); got != 4 {
+		t.Errorf("probed %d times, want 4 (three 503s, then 200)", got)
+	}
+}
+
+// TestWaitForBaseURL_GivesUpAfterTimeout confirms an address that never answers 200 makes startup proceed after the timeout.
+func TestWaitForBaseURL_GivesUpAfterTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "never ready", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	if waitForBaseURL(context.Background(), srv.URL, 150*time.Millisecond, 10*time.Millisecond) {
+		t.Fatal("waitForBaseURL = true for a server that never answers 200")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("waited %s, want it to stop near the 150ms timeout", elapsed)
+	}
+}
+
+// TestWaitForBaseURL_StopsWhenContextEnds confirms shutdown during startup is not held up by the wait.
+func TestWaitForBaseURL_StopsWhenContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	if waitForBaseURL(ctx, "http://127.0.0.1:1", time.Minute, 10*time.Millisecond) {
+		t.Fatal("waitForBaseURL = true for an unreachable address")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("waited %s after the context ended, want it to return promptly", elapsed)
 	}
 }

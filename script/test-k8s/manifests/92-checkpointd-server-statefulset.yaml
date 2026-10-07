@@ -19,31 +19,6 @@ metadata:
   name: checkpointd-server
   namespace: ${NS}
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: checkpointd-server
-  namespace: ${NS}
-# --discover lists ActorTemplate CRDs directly via the Kubernetes API, so it needs RBAC to do so.
-rules:
-  - apiGroups: ["ate.dev"]
-    resources: ["actortemplates"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: checkpointd-server
-  namespace: ${NS}
-subjects:
-  - kind: ServiceAccount
-    name: checkpointd-server
-    namespace: ${NS}
-roleRef:
-  kind: Role
-  name: checkpointd-server
-  apiGroup: rbac.authorization.k8s.io
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -67,22 +42,18 @@ spec:
       containers:
         - name: checkpointd-server
           image: "${CHECKPOINTD_IMAGE}"
-          # --discover finds agents by listing ActorTemplates whose container sets CHECKPOINTD_AGENT=true.
+          # --discover finds agents by listing ActorTemplates through the Control API whose container sets CHECKPOINTD_AGENT=true.
           command:
             - /checkpointd-app/checkpointd
             - --config=/etc/checkpointd/checkpointd.yaml
             - --discover
+            # Scopes --discover to this test's atespace instead of every atespace.
+            - --discover-atespace=${ATESPACE}
             - --addr=:80
             - --base-url=http://checkpointd-server.${NS}.svc:80
             - --substrate-ca-file=/var/run/secrets/ate-system/ca.crt
             # Some subtests (e.g. 01-long-poll.sh) detect relay activity by grepping this pod's own logs for a Debug-level line.
             - --log-level=debug
-          env:
-            # Pins --discover to this Pod's own namespace instead of scanning the whole cluster.
-            - name: CHECKPOINTD_KUBERNETES_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
           ports:
             - containerPort: 80
               name: http

@@ -177,14 +177,14 @@ func (c *controlServer) ResumeActor(_ context.Context, req *ateapipb.ResumeActor
 	name := req.GetActor().GetName()
 	c.mu.Lock()
 	latest := c.snapshots[name]
-	var latestSnapshot *ateapipb.ObjectRef
+	var externalSnapshot *ateapipb.ExternalSnapshot
 	if latest != "" {
-		latestSnapshot = &ateapipb.ObjectRef{Name: latest}
+		externalSnapshot = &ateapipb.ExternalSnapshot{SnapshotUri: latest}
 	}
 	st := &ateapipb.ActorStatus{
 		State:            ateapipb.ActorState_ACTOR_STATE_RUNNING,
 		WorkerAssignment: &ateapipb.WorkerAssignment{WorkerPodIp: c.workerHost},
-		LatestSnapshot:   latestSnapshot,
+		ExternalSnapshot: externalSnapshot,
 	}
 	if c.actors == nil {
 		c.actors = make(map[string]*ateapipb.ActorStatus)
@@ -199,7 +199,7 @@ func (c *controlServer) ResumeActor(_ context.Context, req *ateapipb.ResumeActor
 
 func (c *controlServer) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
 	name := req.GetActor().GetName()
-	// A genuinely successful checkpoint always advances LatestSnapshot to a
+	// A genuinely successful checkpoint always advances its external snapshot to a
 	// fresh name (see this struct's own snapshots field doc comment) -- mint
 	// one here too.
 	snapshot := uuid.NewString()
@@ -208,7 +208,7 @@ func (c *controlServer) SuspendActor(_ context.Context, req *ateapipb.SuspendAct
 		c.snapshots = make(map[string]string)
 	}
 	c.snapshots[name] = snapshot
-	st := &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, LatestSnapshot: &ateapipb.ObjectRef{Name: snapshot}}
+	st := &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED, ExternalSnapshot: &ateapipb.ExternalSnapshot{SnapshotUri: snapshot}}
 	if c.actors == nil {
 		c.actors = make(map[string]*ateapipb.ActorStatus)
 	}
@@ -226,9 +226,4 @@ func (c *controlServer) DeleteActor(_ context.Context, req *ateapipb.DeleteActor
 	delete(c.actors, name)
 	c.mu.Unlock()
 	return &ateapipb.Actor{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
-}
-
-// GetActorSnapshotTag always reports NotFound.
-func (c *controlServer) GetActorSnapshotTag(_ context.Context, req *ateapipb.GetActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
-	return nil, status.Errorf(codes.NotFound, "ActorSnapshot tag %s not found", req.GetActorSnapshotTag().GetName())
 }

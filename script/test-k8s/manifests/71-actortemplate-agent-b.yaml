@@ -13,29 +13,43 @@
 # limitations under the License.
 
 # "agent-b": the Task-state state machine both task-state-a2b and task-state-client2b drive.
-apiVersion: ate.dev/v1alpha1
-kind: ActorTemplate
 metadata:
+  atespace: ${ATESPACE}
   name: agent-b-template
-  namespace: ${NS}
-spec:
-  workerSelector:
-    matchLabels:
-      workload: ${NS}-harness
-  containers:
-    - name: agent-b
-      image: "${AGENT_B_IMAGE}"
-      command: ["/app/agent-b", "--harness-addr", "0.0.0.0:80"]
-      env:
-        # Exposed at /agents/agent-b/, needed by both subtests.
-        - name: CHECKPOINTD_AGENT
-          value: "true"
-        - name: CHECKPOINTD_AGENT_ID
-          value: agent-b
-        - name: CHECKPOINTD_AGENT_CARD
-          value: |
-            name: Agent B
-            description: "A three-turn Task-state state machine: TaskStateWorking (self-continuing), then TaskStateInputRequired, then TaskStateCompleted with a DataPart -- see script/test-k8s/agents/agent_b"
-            version: 1.0.0
-  snapshotsConfig:
-    location: "gs://ate-snapshots/${NS}/agent-b/"
+workerSelector:
+  matchLabels:
+    workload: ${NS}-harness
+containers:
+  - name: agent-b
+    image: "${AGENT_B_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command: ["/app/agent-b", "--harness-addr", "0.0.0.0:80"]
+    env:
+      # Exposed at /agents/agent-b/, needed by both subtests.
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: agent-b
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Agent B
+          description: "A three-turn Task-state state machine: TaskStateWorking (self-continuing), then TaskStateInputRequired, then TaskStateCompleted with a DataPart -- see script/test-k8s/agents/agent_b"
+          version: 1.0.0
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/${NS}/agent-b/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

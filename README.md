@@ -120,7 +120,7 @@ See [`./docs/deployment.md`](./docs/deployment.md) for deployment details.
 
 - Requirement
   - Kubernetes 1.33+
-  - [Agent Substrate](https://github.com/agent-substrate/substrate) (tested with `d909d690532b`)
+  - [Agent Substrate](https://github.com/agent-substrate/substrate) (tested with v0.2.0)
 
 ### Building checkpointd binary using make
 

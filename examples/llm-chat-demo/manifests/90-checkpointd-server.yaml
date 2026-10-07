@@ -24,9 +24,6 @@ metadata:
   name: checkpointd-server
   namespace: checkpointd-llm-chat-demo
 rules:
-  - apiGroups: ["ate.dev"]
-    resources: ["actortemplates"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
@@ -74,6 +71,8 @@ spec:
             # Periodically lists ActorTemplates and serves any with
             # CHECKPOINTD_AGENT=true at /agents/{id}/.
             - --discover
+            # Scopes --discover to the atespace the ActorTemplates were created in instead of every atespace.
+            - --discover-atespace=checkpointd-llm-chat-demo
             - --addr=:80
             - --base-url=http://checkpointd-server.checkpointd-llm-chat-demo.svc:80
             - --substrate-ca-file=/var/run/secrets/ate-system/ca.crt
@@ -81,10 +80,6 @@ spec:
             - --pod-uid=$(POD_UID)
             - --salvage-sweep-interval=30s
           env:
-            - name: CHECKPOINTD_KUBERNETES_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
             - name: POD_NAME
               valueFrom:
                 fieldRef:
