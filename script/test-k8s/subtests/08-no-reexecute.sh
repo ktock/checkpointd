@@ -27,11 +27,13 @@ subtest_no_reexecute() {
   reply_text="$(echo "$LAST_GET_OUT" | jq -r '.status.message.parts[0].text')"
   [[ "$reply_text" == *"hello-no-reexecute"* ]] || fail "reply text = '$reply_text', want it to contain 'hello-no-reexecute' (full response: $LAST_GET_OUT)"
 
+  local restarted_at
+  restarted_at="$(date -u +%s.%N)"
   log "  restarting checkpointd-server-0"
   restart_checkpointd_server_pod
 
   # Resuming an already-completed session is a safe no-op, so the real check is that echo-agent's own actor wasn't invoked again.
-  checkCallNotRepeated "$tenant" "echo-agent" 0 "no-reexecute"
+  checkCallNotRepeated "$tenant" "echo-agent" 0 "no-reexecute" "$restarted_at"
 
   local rerun_resp rerun_state rerun_text
   rerun_resp="$(a2a_cli get task "$ECHO_URL" "$task_id" --tenant "$tenant" -o json)" || fail "a2a get task failed after restart"

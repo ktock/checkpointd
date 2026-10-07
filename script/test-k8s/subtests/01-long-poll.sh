@@ -61,7 +61,7 @@ subtest_long_poll() {
     sleep 3
   done
   [[ "$wait_actor_count" == "2" ]] \
-    || { dump_checkpointd_server_logs; dump_egress_denials; run_kubectl_ate get actors -a "$ATESPACE" >&2 || true; fail "expected 2 distinct long-wait actors (one per concurrent task), found $wait_actor_count (names seen: [$wait_actor_names]; expected $expect_name_1 for tenant_1=$tenant_1 and $expect_name_2 for tenant_2=$tenant_2) -- the two tasks may be sharing one actor"; }
+    || { dump_checkpointd_server_logs; dump_harness_worker_logs; dump_egress_denials; run_kubectl_ate get actors -a "$ATESPACE" >&2 || true; fail "expected 2 distinct long-wait actors (one per concurrent task), found $wait_actor_count (names seen: [$wait_actor_names]; expected $expect_name_1 for tenant_1=$tenant_1 and $expect_name_2 for tenant_2=$tenant_2) -- the two tasks may be sharing one actor"; }
   log "  confirmed: 2 distinct long-wait actors, one per task"
 
   log "durability test 1/2: killing task $task_id_1's own long-wait actor mid-poll"

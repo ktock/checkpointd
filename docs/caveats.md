@@ -5,3 +5,4 @@
 - `CancelTask` never signals the agent's own running logic (`AgentExecutor.Cancel` is never called), so don't rely on cancellation to trigger agent-side cleanup.
 - Clients should store the `tenant` field from a reply's `Metadata` and resend it on later `GetTask`/`CancelTask`/`SendMessage` calls for the same task, to avoid an ambiguous-TaskID lookup failing as not-found.
 - An `externalVolumeTemplate` volume keeps whatever the discarded execution wrote, so a retried turn can see side effects it already made. A `durableDir` volume is part of the snapshot, so it is rewound with it.
+- By mounting the actor's name into every agent, each agent can ensure the the message is actually pointing to that agent and can be resilient against a occasional routing failures/bugs.

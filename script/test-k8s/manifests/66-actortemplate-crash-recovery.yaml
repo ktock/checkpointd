@@ -23,6 +23,9 @@ workerSelector:
 containers:
   - name: crash-recovery-agent
     image: "${CRASH_RECOVERY_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command:
       - /app/crash-recovery-agent
       - --harness-addr
@@ -49,6 +52,15 @@ containers:
                 patterns: ["testserver.${NS}.svc"]
             - hostnames:
                 patterns: ["checkpointd-server.${NS}.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

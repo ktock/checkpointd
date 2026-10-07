@@ -78,7 +78,7 @@ subtest_multi_replica_scaling() {
   # *fourth*, redundant relay (e.g. double-driven from both instances at
   # once), not against agent-b's own expected turn count. Both pods are
   # still up here, so the multi-pod log scrape sees everything.
-  checkCallNotRepeatedAcrossPods "$a_tenant" "agent-b" 3 "scenario A"
+  checkCallNotRepeated "$a_tenant" "agent-b" 3 "scenario A"
 
   # --- Scenario B: the owning instance is scaled in before continuation ----
 

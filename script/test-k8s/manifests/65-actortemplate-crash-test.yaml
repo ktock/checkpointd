@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: crash-test-agent
     image: "${CRASH_TEST_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command:
       - /app/crash-test-agent
       - --harness-addr
@@ -54,6 +57,15 @@ containers:
                 patterns: ["testserver.${NS}.svc"]
             - hostnames:
                 patterns: ["checkpointd-server.${NS}.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
@@ -71,6 +83,9 @@ workerSelector:
 containers:
   - name: crash-test-agent
     image: "${CRASH_TEST_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command:
       - /app/crash-test-agent
       - --harness-addr
@@ -104,6 +119,15 @@ containers:
                 patterns: ["testserver.${NS}.svc"]
             - hostnames:
                 patterns: ["checkpointd-server.${NS}.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

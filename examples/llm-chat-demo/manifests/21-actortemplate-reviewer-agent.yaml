@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: reviewer-agent
     image: "${REVIEWER_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command:
       - /app/reviewer-agent
       - --harness-addr
@@ -48,6 +51,15 @@ containers:
           rules:
             - hostnames:
                 patterns: ["llama-completion.checkpointd-llm-chat-demo.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

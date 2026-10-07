@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: tck-agent
     image: "${TCK_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command: ["/app/tck-agent", "--harness-addr", "0.0.0.0:80"]
     env:
       - name: CHECKPOINTD_AGENT
@@ -33,6 +36,15 @@ containers:
           name: A2A TCK Conformance Agent
           description: Routes on each message's own messageId prefix (tck-input-required, tck-complete-task, tck-reject-task, ...), matching the A2A TCK's own reference SUT -- see script/test-k8s/agents/tck_agent
           version: 1.0.0
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

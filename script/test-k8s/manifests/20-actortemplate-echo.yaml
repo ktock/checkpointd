@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: echo
     image: "${ECHO_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     # Serves just the HarnessService in plaintext on :80.
     command: ["/app/echo-agent", "--harness-addr", "0.0.0.0:80", "--agent-id", "echo-agent"]
     env:
@@ -36,6 +39,15 @@ containers:
           description: Echoes back whatever it's sent -- script/test-k8s/agents/echo_agent, discovered by crash-test-agent via a real AgentCard fetch before it relays to it
           version: 1.0.0
 # FULL snapshot scope makes SuspendActor/ResumeActor a true checkpoint/resume of this process's in-memory state.
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

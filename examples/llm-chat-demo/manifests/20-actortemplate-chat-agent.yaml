@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: chat-agent
     image: "${CHAT_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     command:
       - /app/chat-agent
       - --harness-addr
@@ -53,6 +56,15 @@ containers:
             - hostnames:
                 patterns: ["llama-completion.checkpointd-llm-chat-demo.svc"]
 # FULL snapshot scope captures process memory, letting chat-agent's conversation var survive a checkpoint/resume unaided.
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL

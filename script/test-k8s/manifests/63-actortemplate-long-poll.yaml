@@ -22,6 +22,9 @@ workerSelector:
 containers:
   - name: long-poll
     image: "${LONG_POLL_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
     # --checkpointd-addr lets this resolve long-wait's real AgentCard before calling it.
     command: ["/app/long-poll", "--harness-addr", "0.0.0.0:80", "--checkpointd-addr", "checkpointd-server.${NS}.svc:80", "--testserver-addr", "testserver.${NS}.svc:8080"]
     env:
@@ -43,6 +46,15 @@ containers:
                 patterns: ["testserver.${NS}.svc"]
             - hostnames:
                 patterns: ["checkpointd-server.${NS}.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_FULL
   onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
