@@ -245,9 +245,9 @@ func (h *serverRequestHandler) awaitOrSubmit(reqCtx context.Context, sessionID s
 	// reqCtx ending first).
 	qualifying := make(chan *hop.Envelope, 1)
 	go func() {
+		defer close(done) // runs last: a caller woken by done must find the session already released.
 		defer release()
 		defer mustReleaseSession(context.Background(), h.store, sessionID)
-		defer close(done)
 		r, err := relay(func(q *hop.Envelope) { qualifying <- q })
 		if err != nil {
 			log.Infof("session %s: %v", sessionID, err)

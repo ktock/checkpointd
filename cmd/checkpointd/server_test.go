@@ -741,6 +741,36 @@ func TestServerRequestHandler_GetTask_MessageAfterTaskSkippedNotErrored(t *testi
 	}
 }
 
+// TestAwaitOrSubmit_SessionReleasedBeforeReturn confirms a caller that gets
+// awaitOrSubmit's result can immediately continue the session, because the
+// relay's own release has already completed.
+func TestAwaitOrSubmit_SessionReleasedBeforeReturn(t *testing.T) {
+	c, el, store := newTestServerController(t, nil)
+	h := &serverRequestHandler{agent: "a", c: c, el: el, store: store, registry: newTestRegistry(t)}
+	ctx := context.Background()
+
+	bootstrap := envNew(a2a.MessageRoleUser, checkpointdIdentity, "a", "seed")
+	bk, err := newServerSession(ctx, store, el, "a", "pod-1", "uid-1", bootstrap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var released atomic.Bool
+	release := func() {
+		time.Sleep(100 * time.Millisecond)
+		released.Store(true)
+	}
+	_, err = h.awaitOrSubmit(ctx, bk.sessionID, false, release, func(func(*hop.Envelope)) (*hop.Envelope, error) {
+		return replyFrom(bootstrap, "a", "", "done"), nil
+	})
+	if err != nil {
+		t.Fatalf("awaitOrSubmit: %v", err)
+	}
+	if !released.Load() {
+		t.Fatal("awaitOrSubmit returned before the session was released")
+	}
+}
+
 // TestServerRequestHandler_GetTask_OtherAgentSelfContinuationExcluded
 // confirms assembleTask's own self-continuation/terminal-reply
 // classification is scoped to the task's own owner agent: a different
