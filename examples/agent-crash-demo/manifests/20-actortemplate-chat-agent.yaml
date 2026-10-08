@@ -1,0 +1,79 @@
+# Copyright 2026 checkpointd authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ActorTemplate for chat-agent, built by agents.Dockerfile's `chat-agent` target.
+metadata:
+  atespace: checkpointd-agent-crash-demo
+  name: chat-agent-template
+workerSelector:
+  matchLabels:
+    workload: checkpointd-agent-crash-demo-harness
+containers:
+  - name: chat-agent
+    image: "${CHAT_AGENT_IMAGE}"
+    volumeMounts:
+      - name: system-info
+        mountPath: /run/ate
+    command:
+      - /app/chat-agent
+      - --harness-addr
+      - 0.0.0.0:80
+      - --checkpointd-addr # resolves reviewer-agent's AgentCard
+      - checkpointd-server.checkpointd-agent-crash-demo.svc:80
+      - --llama-addr # in-cluster llama-completion Service
+      - llama-completion.checkpointd-agent-crash-demo.svc:8080
+      - --ledger-addr # in-cluster crash-ledger Service
+      - crash-ledger.checkpointd-agent-crash-demo.svc:8080
+    env:
+      - name: CHECKPOINTD_AGENT
+        value: "true"
+      - name: CHECKPOINTD_AGENT_ID
+        value: chat-agent
+      - name: CHECKPOINTD_AGENT_CARD
+        value: |
+          name: Chat Agent
+          description: >-
+            Stateful chat agent backed by a local llama.cpp completion
+            server -- answers the user, asks reviewer-agent for a second
+            opinion, and deliberately crashes itself on roughly half the
+            turns right after (at most once per turn) -- yet remembers
+            the whole conversation across turns and crashes. See examples/agent-crash-demo
+          version: 1.0.0
+      # Substrate denies all egress to an actor without a policy, so this lists what the agent calls.
+      - name: CHECKPOINTD_EGRESS_POLICY
+        value: |
+          rules:
+            - hostnames:
+                patterns: ["checkpointd-server.checkpointd-agent-crash-demo.svc"]
+            - hostnames:
+                patterns: ["llama-completion.checkpointd-agent-crash-demo.svc"]
+            - hostnames:
+                patterns: ["crash-ledger.checkpointd-agent-crash-demo.svc"]
+# Makes the agent resilient against occasional routing failures or bugs by letting its harness reject a turn addressed to a different actor.
+volumes:
+  - name: system-info
+    systemInfo:
+      dataSources:
+        - actorMetadata:
+            items:
+              - field: ACTOR_METADATA_FIELD_NAME
+                path: actor-name
+# FULL snapshot scope captures process memory, letting chat-agent's conversation var survive a checkpoint/resume unaided.
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_FULL
+  onCommit: SNAPSHOT_CONTENT_SCOPE_FULL
+  storageLocation: "gs://ate-snapshots/checkpointd-agent-crash-demo/chat-agent/"
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default

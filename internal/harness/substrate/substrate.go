@@ -55,7 +55,7 @@ var _ harness.Execution = (*substrateExecution)(nil)
 
 // healthCheckTimeout defines the maximum time Start waits for a freshly
 // created/resumed actor's harness to become reachable and ready.
-const healthCheckTimeout = 60 * time.Second
+const healthCheckTimeout = 10 * time.Second
 
 // workerKeepaliveParams is applied to every gRPC connection to a worker's
 // HarnessService. Without it, a Run call's stream.Recv() loop has no read
