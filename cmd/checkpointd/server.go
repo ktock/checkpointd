@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -362,7 +363,15 @@ func resumeServerSessions(ctx context.Context, c *controller.Controller, el even
 				log.Infof("session %s: owner_uid changed before this restart could re-stamp it (claimed by a concurrent salvage sweep instead), not resuming locally", sess.id)
 				continue
 			}
-			if err := resumeClaimedSession(ctx, c, el, store, registry, sess.id, sess.state); err != nil {
+			if err := startClaimedSession(ctx, c, el, store, registry, sess.id, sess.state); err != nil {
+				if errors.Is(err, errSessionAlreadyDriven) {
+					if sess.ownerUID == podUID {
+						// A request got to this session first, so it is already being driven and there is nothing left to take over.
+						log.Debugf("session %s: already being driven by this instance, not resuming it again", sess.id)
+						continue
+					}
+					panic(fmt.Sprintf("session %s: %v", sess.id, err))
+				}
 				log.Infof("session %s: resuming after restart: %v", sess.id, err)
 				mustRevertClaim(context.Background(), store, sess.id, podName, sess.ownerUID, podUID)
 			}
@@ -410,6 +419,18 @@ func mustReleaseSession(ctx context.Context, store *sqlTaskStore, sessionID stri
 // owner -- is responsible for reverting it via mustRevertClaim on a returned
 // error.
 func resumeClaimedSession(ctx context.Context, c *controller.Controller, el eventlog.EventLog, store *sqlTaskStore, registry *taskRegistry, sessionID, state string) error {
+	err := startClaimedSession(ctx, c, el, store, registry, sessionID, state)
+	if errors.Is(err, errSessionAlreadyDriven) {
+		panic(fmt.Sprintf("session %s: %v", sessionID, err))
+	}
+	return err
+}
+
+// errSessionAlreadyDriven means the local registry already has an active entry for a session this instance won a database-level ownership claim for.
+var errSessionAlreadyDriven = errors.New("registry already has an active entry")
+
+// startClaimedSession does resumeClaimedSession's work but returns errSessionAlreadyDriven on a registry conflict instead of panicking.
+func startClaimedSession(ctx context.Context, c *controller.Controller, el eventlog.EventLog, store *sqlTaskStore, registry *taskRegistry, sessionID, state string) error {
 	bk, bootstrap, ok, err := loadServerSession(ctx, store, el, sessionID)
 	if err != nil {
 		return fmt.Errorf("loading session %s: %w", sessionID, err)
@@ -419,12 +440,12 @@ func resumeClaimedSession(ctx context.Context, c *controller.Controller, el even
 	}
 	taskCtx, release, ok := registry.acquire(context.Background(), sessionID)
 	if !ok {
-		// This can't happen at startup (nothing else has run yet) or from a
-		// correctly functioning salvage sweep (sweeps never run
-		// concurrently with each other or with resumeServerSessions on the
-		// same instance, and a genuinely dead prior owner can't have a
-		// live goroutine anywhere).
-		panic(fmt.Sprintf("session %s: registry already has an active entry, but this call just won a fresh database-level ownership claim for it -- the single-owner invariant is broken", sessionID))
+		// A correctly functioning salvage sweep never gets here (sweeps never
+		// run concurrently with each other or with resumeServerSessions on
+		// the same instance, and a genuinely dead prior owner can't have a
+		// live goroutine anywhere), while startup resume tolerates it for a
+		// session a request has already taken.
+		return errSessionAlreadyDriven
 	}
 	if state == sessionStateTerminating {
 		// A TERMINATING session is a session whose relay loop already
