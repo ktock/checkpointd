@@ -1369,6 +1369,52 @@ func TestResumeServerSessions_PanicsOnRegistryConflict(t *testing.T) {
 	}
 }
 
+// TestResumeServerSessions_SkipsSessionThisInstanceAlreadyDrives confirms a session this very instance already owns and drives
+// (because a request took it before the startup resume got to it) is left alone instead of tripping the single-owner panic,
+// in both the replicated case (matching pod UID) and the single-instance case (no pod name or UID at all).
+func TestResumeServerSessions_SkipsSessionThisInstanceAlreadyDrives(t *testing.T) {
+	for _, tc := range []struct{ name, pod, uid string }{
+		{"replicated", "pod-1", "uid-1"},
+		{"single-instance", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &fakeHarness{respond: func(in *hop.Envelope) (*hop.Envelope, error) {
+				t.Fatal("agent must not be invoked -- the request that already drives the session is the only driver")
+				return nil, nil
+			}}
+			c, el, store := newTestServerController(t, map[string]harness.Harness{"a": a})
+			ctx := context.Background()
+			registry := newTestRegistry(t)
+
+			bootstrap := envNew(a2a.MessageRoleUser, "checkpointd", "a", "seed")
+			bk, err := newServerSession(ctx, store, el, "a", tc.pod, tc.uid, bootstrap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, preRelease, ok := registry.acquire(ctx, bk.sessionID)
+			if !ok {
+				t.Fatal("pre-acquiring the registry entry failed unexpectedly")
+			}
+			defer preRelease()
+
+			if err := resumeServerSessions(ctx, c, el, store, registry, tc.pod, tc.uid); err != nil {
+				t.Fatalf("resumeServerSessions: %v", err)
+			}
+
+			row, err := store.GetSession(ctx, bk.sessionID)
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if row.ownerPod != tc.pod || row.ownerUID != tc.uid {
+				t.Errorf("owner after the skipped resume = (%q, %q), want unchanged (%q, %q)", row.ownerPod, row.ownerUID, tc.pod, tc.uid)
+			}
+			if !registry.isActive(bk.sessionID) {
+				t.Error("the existing driver's registry entry was lost")
+			}
+		})
+	}
+}
+
 // TestResumeServerSessions_SkipsWhenConcurrentlySalvaged confirms the
 // outcome the restamp CAS exists to guarantee: once another instance's
 // ClaimOrphanedSession has reassigned a session (simulating a concurrent
